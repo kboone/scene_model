@@ -1881,7 +1881,7 @@ class ModelElement(object):
 
         return model, mode, full_parameters
 
-    def _extract_parameter(self, parameter_dict, name):
+    def _extract_parameter(self, parameter_dict, name, add_prefix=True):
         """Retrieve a parameter from a dictionary of parameters.
 
         If the parameter isn't in the dictionary, then it is pulled from the
@@ -1889,9 +1889,9 @@ class ModelElement(object):
 
         If the ModelElement class was initialized with a prefix, this method
         adds the prefix in to make the prefix transparent to the calling
-        function.
+        function. To avoid this, pass add_prefix=False.
         """
-        if self.prefix is not None:
+        if add_prefix and self.prefix is not None:
             name = '%s_%s' % (self.prefix, name)
 
         if name in parameter_dict:
@@ -1899,14 +1899,15 @@ class ModelElement(object):
 
         return self[name]
 
-    def _extract_parameters(self, parameter_dict, *names):
+    def _extract_parameters(self, parameter_dict, *names, **kwargs):
         """Retrieve a list of parameters from a dictionary of parameters.
 
         See _extract_parameter for details, this just loops over that.
         """
         result = []
         for name in names:
-            result.append(self._extract_parameter(parameter_dict, name))
+            result.append(self._extract_parameter(parameter_dict, name,
+                                                  **kwargs))
 
         return result
 
@@ -2632,7 +2633,8 @@ class SubsampledModelElement(ModelElement):
         caching functionality.
         """
         parameter_names = self._parameter_info.keys()
-        values = self._extract_parameters(parameters, *parameter_names)
+        values = self._extract_parameters(parameters, *parameter_names,
+                                          add_prefix=False)
         cache_parameters = dict(zip(parameter_names, values))
 
         if mode == 'fourier':
@@ -3062,3 +3064,44 @@ class ExponentialPowerPsfElement(PsfElement):
         fourier_profile = np.exp(-width**power * wr**power)
 
         return fourier_profile
+
+
+def generate_snifs_psf_elements():
+    # Gaussian instrumental core
+    inst_core_element = GaussianPsfElement(prefix='inst_core')
+    inst_core_element.fix(
+        inst_core_sigma_x=0.2376935,
+        inst_core_sigma_y=0.154173,
+        inst_core_rho=0.,
+    )
+
+    # Exponential power function for instrumental wings
+    inst_wings_element = ExponentialPowerPsfElement(prefix='inst_wings')
+    inst_wings_element.fix(
+        inst_wings_power=1.07,
+        inst_wings_width=0.209581,
+    )
+
+    # Seeing
+    seeing_element = ExponentialPowerPsfElement(prefix='seeing')
+    seeing_element.fix(
+        seeing_power=1.52,
+    )
+
+    # Tracking
+    tracking_element = GaussianPsfElement(prefix='tracking')
+    tracking_element.fix(
+        tracking_rho=0.99
+    )
+
+    elements = [
+        PointSource,
+        Background,
+        inst_core_element,
+        inst_wings_element,
+        seeing_element,
+        tracking_element,
+        Pixelizer,
+    ]
+
+    return elements
