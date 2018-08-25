@@ -610,7 +610,7 @@ class SceneModel(object):
 
             # Make sure that we don't duplicate any parameters.
             model_parameters = self.parameters
-            for parameter in element._parameters:
+            for parameter in element._parameter_info:
                 if parameter in model_parameters:
                     raise PsfModelException(
                         "Model has two parameters with the name %s! (second "
@@ -911,7 +911,7 @@ class SceneModel(object):
         """
         parameter_info = OrderedDict()
         for element in self.elements:
-            parameter_info.update(element._parameters)
+            parameter_info.update(element._parameter_info)
 
         return parameter_info
 
@@ -940,7 +940,7 @@ class SceneModel(object):
     def get_parameter_element(self, parameter_name):
         """Find the element that is responsible for a certain parameter"""
         for element in self.elements:
-            if parameter_name in element._parameters:
+            if parameter_name in element._parameter_info:
                 return element
 
         # Didn't find it.
@@ -1680,7 +1680,7 @@ class ModelElement(object):
         self._cache_misses = 0
         self.clear_cache()
 
-        self._parameters = OrderedDict()
+        self._parameter_info = OrderedDict()
         self._setup_parameters()
 
     def _add_parameter(self, name, value, bounds, fits_keyword=None,
@@ -1700,7 +1700,7 @@ class ModelElement(object):
         if self.prefix is not None:
             name = '%s_%s' % (self.prefix, name)
 
-        self._parameters[name] = new_parameter
+        self._parameter_info[name] = new_parameter
 
     def _setup_parameters(self):
         """Initialize the parameters for a given image.
@@ -1717,7 +1717,7 @@ class ModelElement(object):
             # is no longer applicable.
             kwargs['value'] = None
 
-        self._parameters[name].update(kwargs)
+        self._parameter_info[name].update(kwargs)
 
     def fix(self, **kwargs):
         """Fix a set of parameters to a given set of values.
@@ -1726,7 +1726,7 @@ class ModelElement(object):
         unfixed.
         """
         for key, value in kwargs.items():
-            parameter_dict = self._parameters[key]
+            parameter_dict = self._parameter_info[key]
 
             if parameter_dict['derived']:
                 raise PsfModelException(
@@ -1747,13 +1747,13 @@ class ModelElement(object):
 
     def is_fixed(self, parameter):
         """Return whether a parameter is fixed or not"""
-        return self._parameters[parameter]['fixed']
+        return self._parameter_info[parameter]['fixed']
 
     @property
     def parameters(self):
         """Return a list of the current parameter values."""
         full_parameters = OrderedDict()
-        for parameter_name, parameter_dict in self._parameters.items():
+        for parameter_name, parameter_dict in self._parameter_info.items():
             full_parameters[parameter_name] = parameter_dict['value']
 
         return full_parameters
@@ -1764,7 +1764,7 @@ class ModelElement(object):
         coefficients for each component of the model.
         """
         coefficients = OrderedDict()
-        for parameter_name, parameter_dict in self._parameters.items():
+        for parameter_name, parameter_dict in self._parameter_info.items():
             if not parameter_dict['coefficient']:
                 continue
             coefficients[parameter_name] = parameter_dict['value']
@@ -1777,7 +1777,7 @@ class ModelElement(object):
         coefficients.
         """
         coefficient_info = OrderedDict()
-        for parameter_name, parameter_dict in self._parameters.items():
+        for parameter_name, parameter_dict in self._parameter_info.items():
             if not parameter_dict['coefficient']:
                 continue
             coefficient_info[parameter_name] = parameter_dict
@@ -1787,11 +1787,11 @@ class ModelElement(object):
     def set_parameters(self, update_derived=True, **kwargs):
         """Set parameters to the given values."""
         for key, value in kwargs.items():
-            if key not in self._parameters:
+            if key not in self._parameter_info:
                 raise PsfModelException("%s has no parameter named %s." %
                                         (type(self), key))
 
-            parameter_dict = self._parameters[key]
+            parameter_dict = self._parameter_info[key]
 
             # Make sure that we aren't changing any derived parameters unless
             # explicitly told to do so.
@@ -1831,7 +1831,7 @@ class ModelElement(object):
 
     def __getitem__(self, parameter):
         """Return the value of a given parameter"""
-        return self._parameters[parameter]['value']
+        return self._parameter_info[parameter]['value']
 
     def __setitem__(self, parameter, value):
         """Set the value of a given parameter"""
@@ -2079,7 +2079,7 @@ class SubsampledModelElement(ModelElement):
         This function can be used in place of _evaluate to directly gain
         caching functionality.
         """
-        parameter_names = self._parameters.keys()
+        parameter_names = self._parameter_info.keys()
         values = self._extract_parameters(parameters, *parameter_names)
         cache_parameters = dict(zip(parameter_names, values))
 
@@ -2154,7 +2154,7 @@ class ModelComponent(SubsampledModelElement):
             # Don't apply coefficients to the model. This means that the scales
             # of the components should be set to 1.
             unscale_parameters = {}
-            for parameter_name, parameter_dict in self._parameters.items():
+            for parameter_name, parameter_dict in self._parameter_info.items():
                 if parameter_dict['coefficient']:
                     unscale_parameters[parameter_name] = 1.
             parameters = dict(parameters, **unscale_parameters)
