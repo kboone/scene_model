@@ -152,10 +152,18 @@ def calculate_covariance_finite_difference(chisq_function, parameter_names,
                     direction = 1.
 
         while True:
+            # Estimate the second derivative numerator for a finite difference
+            # calculation. We want to choose a step size that sets this to a
+            # reasonable value. Note that we move only in the direction away
+            # from the nearest boundary, so this isn't centered at the correct
+            # position, but this is only to get an initial estimate of the
+            # scale so it doesn't matter.
             step_values = values.copy()
             step_values[parameter_idx] += step * direction
-            new_chisq = chisq_function(step_values)
-            diff = new_chisq - ref_chisq
+            step_1_chisq = chisq_function(step_values)
+            step_values[parameter_idx] += step * direction
+            step_2_chisq = chisq_function(step_values)
+            diff = 0.25 * step_2_chisq - 0.5 * step_1_chisq + 0.25 * ref_chisq
 
             if diff < -1e-4:
                 # We found a minimum that is better than the supposed true
@@ -214,16 +222,16 @@ def calculate_covariance_finite_difference(chisq_function, parameter_names,
         step = steps[parameter_idx]
 
         direction_str = None
-        if min_bound is not None and value - step < min_bound:
+        if min_bound is not None and value - 2*step < min_bound:
             direction_str = "up"
-            values[parameter_idx] = min_bound + step
-        elif max_bound is not None and value + step > max_bound:
+            values[parameter_idx] = min_bound + 2*step
+        elif max_bound is not None and value + 2*step > max_bound:
             direction_str = "down"
-            values[parameter_idx] = max_bound - step
+            values[parameter_idx] = max_bound - 2*step
 
-        if direction_str is not None:
-            print("WARNING: Parameter %s is at bound! Moving %s by %f to "
-                  "calculate covariance!" % (name, direction_str, step))
+        if direction_str is not None and verbose:
+            print("WARNING: Parameter %s is at bound! Moving %s by %g to "
+                  "calculate covariance!" % (name, direction_str, 2*step))
 
     # Calculate all of the terms that will be required to calculate the finite
     # differences. Note that there is a lot of reuse of terms, so here we
@@ -3070,8 +3078,8 @@ def generate_snifs_psf_elements():
     # Gaussian instrumental core
     inst_core_element = GaussianPsfElement(prefix='inst_core')
     inst_core_element.fix(
-        inst_core_sigma_x=0.2376935,
-        inst_core_sigma_y=0.154173,
+        inst_core_sigma_x=0.2376935 / np.sqrt(2.),
+        inst_core_sigma_y=0.154173 / np.sqrt(2.),
         inst_core_rho=0.,
     )
 
@@ -3093,6 +3101,10 @@ def generate_snifs_psf_elements():
     tracking_element.fix(
         tracking_rho=0.99
     )
+    tracking_element._modify_parameter('tracking_sigma_x', value=0.1,
+                                       bounds=(-30., 30.))
+    tracking_element._modify_parameter('tracking_sigma_y', value=0.1,
+                                       bounds=(-30., 30.))
 
     elements = [
         PointSource,
