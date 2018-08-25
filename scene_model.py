@@ -629,24 +629,14 @@ class SceneModel(object):
         # Clear the cache to set up cache-related structures.
         self.clear_cache()
 
-    def setup_grid(self, grid_size, border=None, subsampling=None):
-        """Setup the model to be evaluated on a specific sized grid.
+    def _create_grid(self, grid_size, border, subsampling):
+        """Create a grid that the model can be evaluated on.
 
         grid_size should be a tuple with the y and x dimensions.
 
-        If border and subsampling aren't specified, they are taken from
-        self.border and self.subsampling.
+        This returns a dictionary with all of the different variables needed to
+        evaluate the model in both real and Fourier space.
         """
-        if border is None:
-            border = self.border
-        else:
-            self.border = border
-
-        if subsampling is None:
-            subsampling = self.subsampling
-        else:
-            self.subsampling = subsampling
-
         grid_width_y, grid_width_x = grid_size
 
         # Set up an ij grid which has integer indexing of the pixels starting
@@ -730,6 +720,29 @@ class SceneModel(object):
             'pad_fft_shift': pad_fft_shift,
             'pad_ifft_shift': pad_ifft_shift,
         }
+
+        return grid_info
+
+    def setup_grid(self, grid_size, border=None, subsampling=None):
+        """Setup the model to be evaluated on a specific sized grid.
+
+        If border and subsampling aren't specified, they are taken from
+        self.border and self.subsampling.
+
+        See _create_grid for details, this is a small wrapper around that
+        method that saves the grid internally.
+        """
+        if border is None:
+            border = self.border
+        else:
+            self.border = border
+
+        if subsampling is None:
+            subsampling = self.subsampling
+        else:
+            self.subsampling = subsampling
+
+        grid_info = self._create_grid(grid_size, border, subsampling)
 
         self.grid_info = grid_info
 
@@ -903,26 +916,26 @@ class SceneModel(object):
         return parameter_info
 
     @property
-    def scale_parameters(self):
-        """Return an ordered dictionary of the scale parameters that are the
-        coefficients for each component of the model.
+    def coefficients(self):
+        """Return an ordered dictionary of the coefficient parameters that
+        scale each component of the model.
         """
-        scale_parameters = OrderedDict()
+        coefficients = OrderedDict()
         for element in self.elements:
-            scale_parameters.update(element.scale_parameters)
+            coefficients.update(element.coefficients)
 
-        return scale_parameters
+        return coefficients
 
     @property
-    def _scale_parameter_info(self):
+    def _coefficient_info(self):
         """Return an ordered dictionary of the full information for each of the
-        scale parameters.
+        coefficient parameters
         """
-        scale_parameter_info = OrderedDict()
+        coefficient_info = OrderedDict()
         for element in self.elements:
-            scale_parameter_info.update(element._scale_parameter_info)
+            coefficient_info.update(element._coefficient_info)
 
-        return scale_parameter_info
+        return coefficient_info
 
     def get_parameter_element(self, parameter_name):
         """Find the element that is responsible for a certain parameter"""
@@ -934,7 +947,7 @@ class SceneModel(object):
         raise PsfModelException("No parameter %s found!" % parameter_name)
 
     def evaluate(self, grid_info=None, separate_components=False,
-                 apply_scales=True, return_full_parameters=False,
+                 apply_coefficients=True, return_full_parameters=False,
                  **parameters):
         """Evaluate the scene model with the given parameters.
 
@@ -957,8 +970,8 @@ class SceneModel(object):
 
         for element in self.elements:
             model, mode, parameters = element._update_model(
-                grid_info, model, mode, separate_components, apply_scales,
-                **parameters
+                grid_info, model, mode, separate_components,
+                apply_coefficients, **parameters
             )
 
         # Warn the user if we don't end up with a pixelated image in the end.
@@ -987,7 +1000,7 @@ class SceneModel(object):
             element.clear_cache()
 
     def chi_square(self, parameters={}, return_full_info=False,
-                   do_analytic_scales=True, apply_fit_scale=False,
+                   do_analytic_coefficients=True, apply_fit_scale=False,
                    apply_priors=True):
         """Calculate the chi-square value for a given set of model parameters.
 
@@ -1019,7 +1032,7 @@ class SceneModel(object):
         call_info = {
             'parameters': parameters,
             'return_full_info': return_full_info,
-            'do_analytic_scales': do_analytic_scales,
+            'do_analytic_coefficients': do_analytic_coefficients,
             'apply_fit_scale': apply_fit_scale,
             'apply_priors': apply_priors,
         }
@@ -1042,26 +1055,27 @@ class SceneModel(object):
             use_variance = use_variance / self.fit_scale**2
 
         # Evaluate the model
-        if do_analytic_scales:
-            # The scale parameters need to be evaluated analytically. We first
-            # evaluate all of the model components without the scales applied,
-            # and then we calculate the scales using an analytic least-squares
-            # fit.
+        if do_analytic_coefficients:
+            # The coefficients need to be evaluated analytically. We first
+            # evaluate all of the model components without the coefficients
+            # applied, and then we calculate the coefficients using an analytic
+            # least-squares fit.
             components, eval_parameters = self.evaluate(
-                separate_components=True, apply_scales=False,
+                separate_components=True, apply_coefficients=False,
                 return_full_parameters=True, **parameters
             )
 
-            # Evaluate the scale parameters analytically
-            scale_parameters, scale_variances = \
-                self._calculate_scale_parameters(
+            # Evaluate the coefficients analytically
+            coef_names, coef_values, coef_variances = \
+                self._calculate_coefficients(
                     components, use_data, use_variance, use_mask,
                     **eval_parameters
                 )
-            full_parameters = dict(eval_parameters, **scale_parameters)
+            coef_dict = dict(zip(coef_names, coef_values))
+            full_parameters = dict(eval_parameters, **coef_dict)
 
             # Build the final model
-            model = self._apply_scale_parameters(components, **full_parameters)
+            model = self._apply_coefficients(components, **full_parameters)
         else:
             model, full_parameters = self.evaluate(
                 return_full_parameters=True, **parameters
@@ -1091,25 +1105,24 @@ class SceneModel(object):
 
         return return_val
 
-    def _calculate_scale_parameters(self, components, data, variance, mask,
-                                    **parameters):
-        """Calculate the scale parameters analytically given a list of PSF
-        components.
+    def _calculate_coefficients(self, components, data, variance, mask,
+                                **parameters):
+        """Calculate the coefficients analytically given a list of components.
 
-        If return_variance is True, the statistical variance on the fit of the
-        scale parameters is returned. This does not take into account
-        systematic uncertainties from fitting the model!
+        This returns a list of component names, an array with the coefficient
+        values and an array with the coefficient statistical variances. Note
+        that the returned variances do not take into account systematic
+        uncertainties from fitting the model!
         """
-        # Get information on the scale parameters
-        scale_parameter_info = self._scale_parameter_info
+        coefficient_info = self._coefficient_info
 
         # Figure out which parameters need to be fit, and subtract any fixed
         # parameters from the data.
         model = 0.
         basis = []
-        fit_parameters = []
+        parameter_names = []
         for component, (parameter_name, parameter_dict) in \
-                zip(components, scale_parameter_info.items()):
+                zip(components, coefficient_info.items()):
             mask_component = component[mask]
             if parameter_dict['fixed']:
                 # Don't need to fit this parameter, add it to the model
@@ -1121,11 +1134,11 @@ class SceneModel(object):
             else:
                 # Need to fit this parameter, add it to the basis
                 basis.append(mask_component)
-                fit_parameters.append(parameter_name)
+                parameter_names.append(parameter_name)
 
-        if len(fit_parameters) == 0:
-            # There are no scale parameters that need to be analytically
-            # evaluated, we're done.
+        if len(parameter_names) == 0:
+            # There are no coefficients that need to be analytically evaluated,
+            # we're done.
             return {}, {}
 
         basis = np.vstack(basis).T
@@ -1148,24 +1161,17 @@ class SceneModel(object):
             # and it evaluates to 0 everywhere.
             raise PsfModelException("Found degenerate model for parameters: %s"
                                     % parameters)
-        scales = np.dot(cov, beta)
+        values = np.dot(cov, beta)
         variances = np.diag(cov)
 
-        scale_dict = {}
-        variance_dict = {}
-        for parameter_name, scale, variance in zip(fit_parameters, scales,
-                                                   variances):
-            scale_dict[parameter_name] = scale
-            variance_dict[parameter_name] = variance
+        return parameter_names, values, variances
 
-        return scale_dict, variance_dict
-
-    def _apply_scale_parameters(self, components, **parameters):
-        """Apply the scale parameters to the model."""
-        scale_parameter_info = self._scale_parameter_info
+    def _apply_coefficients(self, components, **parameters):
+        """Apply the coefficients for each component to get the full model."""
+        coefficient_info = self._coefficient_info
         model = 0.
         for component, (parameter_name, parameter_dict) in \
-                zip(components, scale_parameter_info.items()):
+                zip(components, coefficient_info.items()):
             if parameter_name in parameters:
                 value = parameters[parameter_name]
             else:
@@ -1174,14 +1180,14 @@ class SceneModel(object):
 
         return model
 
-    def _get_fit_parameters(self, do_analytic_scales=True,
+    def _get_fit_parameters(self, do_analytic_coefficients=True,
                             apply_fit_scale=True):
         """Return the information needed to do a fit with a flat parameter
         vector (what scipy needs)
 
-        If do_analytic_scales is True, then all scale parameters (eg:
-        amplitude, background) are analytically solved for and aren't included
-        in the list of fit parameters.
+        If do_analytic_coefficients is True, then all coefficient parameters
+        (eg: amplitude, background) are analytically solved for and aren't
+        included in the list of fit parameters.
 
         If apply_fit_scale is True, then all scale parameters are scaled by the
         internal scale parameter (an estimate of the amplitude).
@@ -1200,15 +1206,16 @@ class SceneModel(object):
 
         for parameter_name, parameter_dict in self._parameter_info.items():
             if (parameter_dict['fixed'] or parameter_dict['derived'] or
-                    (parameter_dict['scale'] and do_analytic_scales)):
+                    (parameter_dict['coefficient'] and
+                     do_analytic_coefficients)):
                 # Parameter that isn't fitted, ignore it.
                 continue
 
             new_dict = parameter_dict.copy()
 
-            if parameter_dict['scale']:
-                # Parameter that should be scaled for fits. Scale it by the
-                # predetermined amount.
+            if parameter_dict['coefficient']:
+                # Parameter that is the coefficient for a component. Scale it
+                # by the predetermined amount.
                 if new_dict['value'] is not None:
                     new_dict['value'] = new_dict['value'] / fit_scale
                 lower_bound, upper_bound = new_dict['bounds']
@@ -1224,8 +1231,8 @@ class SceneModel(object):
 
         return parameters
 
-    def fit(self, do_analytic_scales=True, verbose=False):
-        fit_parameters = self._get_fit_parameters(do_analytic_scales)
+    def fit(self, do_analytic_coefficients=True, verbose=False):
+        fit_parameters = self._get_fit_parameters(do_analytic_coefficients)
 
         parameter_names = list(fit_parameters.keys())
         initial_values = [i['value'] for i in fit_parameters.values()]
@@ -1239,7 +1246,7 @@ class SceneModel(object):
 
             return self.chi_square(
                 map_parameters,
-                do_analytic_scales=do_analytic_scales,
+                do_analytic_coefficients=do_analytic_coefficients,
                 return_full_info=return_full_info,
                 apply_fit_scale=apply_fit_scale,
             )
@@ -1295,7 +1302,9 @@ class SceneModel(object):
         evaluates the Hessian. This is typically the fastest method for
         complicated models and is extremely accurate.
         """
-        fit_parameters = self._get_fit_parameters(do_analytic_scales=False)
+        fit_parameters = self._get_fit_parameters(
+            do_analytic_coefficients=False
+        )
 
         parameter_names = list(fit_parameters.keys())
         values = np.array([i['value'] for i in fit_parameters.values()])
@@ -1306,8 +1315,10 @@ class SceneModel(object):
             map_parameters = {i: j for i, j in zip(parameter_names,
                                                    flat_parameters)}
 
-            return self.chi_square(map_parameters, do_analytic_scales=False,
-                                   apply_fit_scale=True)
+            return self.chi_square(
+                map_parameters, do_analytic_coefficients=False,
+                apply_fit_scale=True
+            )
 
         if method == 'minuit':
             cov = calculate_covariance_minuit(
@@ -1326,7 +1337,7 @@ class SceneModel(object):
         else:
             raise PsfModelException('Unknown method %s' % method)
 
-        # Rescale analytic parameters.
+        # Rescale parameters.
         cov *= np.outer(scales, scales)
 
         return parameter_names, cov
@@ -1414,11 +1425,97 @@ class SceneModel(object):
 
         print("="*70)
 
+    def generate_psf(self, grid_size=None, subsampling=11, **parameters):
+        """Generate a model of the PSF.
+
+        This is typically run with high subsampling to get a very detailed PSF
+        model.
+
+        Note this function only takes into account elements that are subclassed
+        from PSF element. When working with the output of this function,
+        sampling from the oversampled image is appropriate rather than
+        integrating over it.
+
+        This returns a grid_info dictionary and the resulting PSF model.
+        """
+        if grid_size is None:
+            grid_size_y, grid_size_x = self.grid_info['grid_size']
+            border = self.grid_info['border']
+            grid_size = (grid_size_y + 2*border, grid_size_x + 2*border)
+
+        grid_info = self._create_grid(grid_size, 0, subsampling)
+
+        # Start with a point source at the center of the image.
+        point_source = PointSource()
+        model, mode, point_source_parameters = point_source._update_model(
+            grid_info, 0., None, False, True, center_x=0., center_y=0.,
+            amplitude=1.
+        )
+
+        # Use the current model parameters as a base, but override with
+        # anything that is passed in.
+        parameters = dict(self.parameters, **parameters)
+
+        for element in self.elements:
+            # Only use PsfElement elements. The PSF is considered to be the
+            # convolution of all of those elements.
+            if isinstance(element, PsfElement):
+                model, mode, parameters = element._update_model(
+                    grid_info, model, mode, False, True, **parameters
+                )
+
+        if mode == 'fourier':
+            model = _fourier_to_real(model, grid_info)
+            mode = 'real'
+        elif mode != 'real':
+            raise PsfModelException("PSF generation ended up in unknown mode "
+                                    "%s. Can't handle!" % mode)
+
+        return grid_info, model
+
+    def calculate_fwhm(self, grid_size=None, subsampling=11, **parameters):
+        """Calculate the FWHM in pixels of the PSF.
+
+        This function generates a highly oversampled PSF, and then measures the
+        peak amplitude of the PSF along with the number of pixels above the
+        half-maximum. This count is then converted into an equivalent FWHM for
+        a fully-circular PSF.
+        """
+        if grid_size is None:
+            grid_size_y, grid_size_x = self.grid_info['grid_size']
+            border = self.grid_info['border']
+            grid_size = (grid_size_y + 2*border, grid_size_x + 2*border)
+
+        if grid_size[0] % 2 == 0 or grid_size[1] % 2 == 0:
+            raise PsfModelException(
+                "grid sizes should be odd or the maximum value will not be "
+                "found!"
+            )
+
+        if subsampling % 2 == 0:
+            raise PsfModelException(
+                "oversampling should be odd or the maximum value will not be "
+                "found!"
+            )
+
+        psf_grid_info, psf = self.generate_psf(grid_size, subsampling)
+        scale_psf = psf / np.max(psf)
+
+        # Count how many pixels are above the half-maximum.
+        num_half_max = np.sum(scale_psf > 0.5)
+
+        # Work out the FWHM for a circle with the corresponding area.
+        fwhm = 2 * np.sqrt(num_half_max / np.pi) / subsampling
+
+        return fwhm
+
     @property
     def degrees_of_freedom(self):
         """Calculate how many degrees of freedom there are in the fit"""
         num_data = len(self.fit_data)
-        fit_parameters = self._get_fit_parameters(do_analytic_scales=False)
+        fit_parameters = self._get_fit_parameters(
+            do_analytic_coefficients=False
+        )
         num_parameters = len(fit_parameters)
 
         return num_data - num_parameters
@@ -1578,21 +1675,23 @@ class ModelElement(object):
         """
         self.prefix = prefix
 
+        # Set up the cache
         self._cache_hits = 0
         self._cache_misses = 0
+        self.clear_cache()
 
         self._parameters = OrderedDict()
         self._setup_parameters()
 
     def _add_parameter(self, name, value, bounds, fits_keyword=None,
-                       fits_description=None, fixed=False, scale=False,
+                       fits_description=None, fixed=False, coefficient=False,
                        derived=False):
         """Add a parameter to the model."""
         new_parameter = {
             'value': value,
             'bounds': bounds,
             'fixed': fixed,
-            'scale': scale,
+            'coefficient': coefficient,
             'derived': derived,
             'fits_keyword': fits_keyword,
             'fits_description': fits_description,
@@ -1660,30 +1759,30 @@ class ModelElement(object):
         return full_parameters
 
     @property
-    def scale_parameters(self):
-        """Return an ordered dictionary of the scale parameters that are the
+    def coefficients(self):
+        """Return an ordered dictionary of the parameters that are the
         coefficients for each component of the model.
         """
-        scale_parameters = OrderedDict()
+        coefficients = OrderedDict()
         for parameter_name, parameter_dict in self._parameters.items():
-            if not parameter_dict['scale']:
+            if not parameter_dict['coefficient']:
                 continue
-            scale_parameters[parameter_name] = parameter_dict['value']
+            coefficients[parameter_name] = parameter_dict['value']
 
-        return scale_parameters
+        return coefficients
 
     @property
-    def _scale_parameter_info(self):
+    def _coefficient_info(self):
         """Return an ordered dictionary of the full information for each of the
-        scale parameters.
+        coefficients.
         """
-        scale_parameter_info = OrderedDict()
+        coefficient_info = OrderedDict()
         for parameter_name, parameter_dict in self._parameters.items():
-            if not parameter_dict['scale']:
+            if not parameter_dict['coefficient']:
                 continue
-            scale_parameter_info[parameter_name] = parameter_dict
+            coefficient_info[parameter_name] = parameter_dict
 
-        return scale_parameter_info
+        return coefficient_info
 
     def set_parameters(self, update_derived=True, **kwargs):
         """Set parameters to the given values."""
@@ -1739,7 +1838,7 @@ class ModelElement(object):
         self.set_parameters(**{parameter: value})
 
     def _update_model(self, grid_info, model, mode, separate_components,
-                      apply_scales, **parameters):
+                      apply_coefficients, **parameters):
         """Apply the model element to a model.
 
         The behavior here needs to be implemented in subclasses. model is the
@@ -1749,9 +1848,10 @@ class ModelElement(object):
 
         If separate_components is True, then model is a list of all of the
         individual components of the model (eg: a PSF, a galaxy, a background)
-        rather than a single image. For separate components, if apply_scales is
-        True, then the components are scaled by their respective amplitudes. If
-        not, they are returned with a scale of 1 (this is used for fitting).
+        rather than a single image. For separate components, if
+        apply_coefficients is True, then the components are scaled by their
+        respective coefficients. If not, they are returned with a scale of 1
+        (this is used for fitting).
 
         The exact behavior here will vary. Some examples are:
         - ModelComponent: adds new components in to the model (eg: a point
@@ -1907,10 +2007,10 @@ class SubsampledModelElement(ModelElement):
         the other will be derived with an FFT.
 
         Note that all of the parameters will be passed in to this function,
-        including fixed, derived, scale, etc. ones that are not necessarily
-        used by the element. The parameters that are used can be explicitly
-        added as function arguments, but a **parameters key should be used to
-        capture extra ones.
+        including fixed, derived, coefficient, etc. ones that are not
+        necessarily used by the element. The parameters that are used can be
+        explicitly added as function arguments, but a **parameters key should
+        be used to capture extra ones.
 
         grid_info contains all of the grid information. Most of the time this
         isn't necessary and it can just be ignored, or left to go into
@@ -2032,11 +2132,11 @@ class ModelComponent(SubsampledModelElement):
     Examples of components are point sources, galaxies, backgrounds, etc.
     """
     def _update_model(self, grid_info, model, mode, separate_components,
-                      apply_scales, **parameters):
+                      apply_coefficients, **parameters):
         """Add the components defined by this class to a model."""
         # Apply any parent class updates
         model, mode, parameters = super(ModelComponent, self)._update_model(
-            grid_info, model, mode, separate_components, apply_scales,
+            grid_info, model, mode, separate_components, apply_coefficients,
             **parameters
         )
 
@@ -2050,12 +2150,12 @@ class ModelComponent(SubsampledModelElement):
             else:
                 mode = 'real'
 
-        if not apply_scales:
-            # Don't apply scales to the model. This means that the scales
-            # should be set to 1.
+        if not apply_coefficients:
+            # Don't apply coefficients to the model. This means that the scales
+            # of the components should be set to 1.
             unscale_parameters = {}
             for parameter_name, parameter_dict in self._parameters.items():
-                if parameter_dict['scale']:
+                if parameter_dict['coefficient']:
                     unscale_parameters[parameter_name] = 1.
             parameters = dict(parameters, **unscale_parameters)
 
@@ -2100,12 +2200,12 @@ class ConvolutionElement(SubsampledModelElement):
     Examples of convolutions are PSFs, ADR, etc.
     """
     def _update_model(self, grid_info, model, mode, separate_components,
-                      apply_scales, **parameters):
+                      apply_coefficients, **parameters):
         """Add the components defined by this class to a model."""
         # Apply any parent class updates
         model, mode, parameters = super(ConvolutionElement, self).\
             _update_model(
-            grid_info, model, mode, separate_components, apply_scales,
+            grid_info, model, mode, separate_components, apply_coefficients,
             **parameters
         )
 
@@ -2147,7 +2247,14 @@ class ConvolutionElement(SubsampledModelElement):
         return convolved_model, mode, parameters
 
 
-class PsfModel(ConvolutionElement):
+class PsfElement(ConvolutionElement):
+    """Class for elements of a PSF model.
+
+    This class is just a wrapper around ConvolutionElement, but is used to
+    identify which components are part of the PSF. This identification is
+    important for things like calculating the FWHM of the PSF where not all
+    effects should be included.
+    """
     pass
 
 
@@ -2159,11 +2266,11 @@ class Pixelizer(ModelElement):
     and any operations have to happen on the pixelated grid.
     """
     def _update_model(self, grid_info, model, mode, separate_components,
-                      apply_scales, **parameters):
+                      apply_coefficients, **parameters):
         """Pixelate the image"""
         # Apply any parent class updates
         model, mode, parameters = super(Pixelizer, self)._update_model(
-            grid_info, model, mode, separate_components, apply_scales,
+            grid_info, model, mode, separate_components, apply_coefficients,
             **parameters
         )
 
@@ -2232,11 +2339,11 @@ class RealPixelizer(ModelElement):
     is much smaller than the scale at which the model varies.
     """
     def _update_model(self, grid_info, model, mode, separate_components,
-                      apply_scales, **parameters):
+                      apply_coefficients, **parameters):
         """Pixelate the image"""
         # Apply any parent class updates
         model, mode, parameters = super(RealPixelizer, self)._update_model(
-            grid_info, model, mode, separate_components, apply_scales,
+            grid_info, model, mode, separate_components, apply_coefficients,
             **parameters
         )
 
@@ -2277,7 +2384,7 @@ class RealPixelizer(ModelElement):
 class PointSource(ModelComponent):
     def _setup_parameters(self):
         self._add_parameter('amplitude', None, (None, None), 'AMP',
-                            'Point source amplitude', scale=True)
+                            'Point source amplitude', coefficient=True)
         self._add_parameter('center_x', None, (None, None), 'POSX',
                             'Point source center position X')
         self._add_parameter('center_y', None, (None, None), 'POSY',
@@ -2299,7 +2406,7 @@ class PointSource(ModelComponent):
 class Background(ModelComponent):
     def _setup_parameters(self):
         self._add_parameter('background', None, (None, None), 'BKG',
-                            'Background in cube', scale=True)
+                            'Background in cube', coefficient=True)
 
     def _evaluate(self, x, y, subsampling, **parameters):
         background = self._extract_parameter(parameters, 'background')
@@ -2307,9 +2414,9 @@ class Background(ModelComponent):
         return np.ones(x.shape) * background / subsampling**2
 
 
-class GaussianPsfModel(PsfModel):
+class GaussianPsfElement(PsfElement):
     def _setup_parameters(self):
-        super(GaussianPsfModel, self)._setup_parameters()
+        super(GaussianPsfElement, self)._setup_parameters()
 
         self._add_parameter('sigma_x', 1., (0.1, 20.), 'SIGX',
                             'Gaussian width in X direction')
@@ -2349,9 +2456,9 @@ class GaussianPsfModel(PsfModel):
         return gaussian
 
 
-class GaussianMoffatPsfModel(PsfModel):
+class GaussianMoffatPsfElement(PsfElement):
     def _setup_parameters(self):
-        super(GaussianMoffatPsfModel, self)._setup_parameters()
+        super(GaussianMoffatPsfElement, self)._setup_parameters()
 
         self._add_parameter('alpha', 2.5, (0.1, 15.), 'ALPHA', 'Moffat width')
         self._add_parameter('sigma', 1., (0.5, 5.), 'SIGMA', 'Gaussian width')
@@ -2361,12 +2468,9 @@ class GaussianMoffatPsfModel(PsfModel):
         self._add_parameter('xy', 0., (-0.6, 0.6), 'XY', 'XY coefficient')
 
     def _evaluate(self, x, y, subsampling, **parameters):
-        alpha = self._extract_parameter(parameters, 'alpha')
-        sigma = self._extract_parameter(parameters, 'sigma')
-        beta = self._extract_parameter(parameters, 'beta')
-        eta = self._extract_parameter(parameters, 'eta')
-        ell = self._extract_parameter(parameters, 'ell')
-        xy = self._extract_parameter(parameters, 'xy')
+        alpha, sigma, beta, eta, ell, xy = self._extract_parameters(
+            parameters, 'alpha', 'sigma', 'beta', 'eta', 'ell', 'xy'
+        )
 
         # Issue: with the pipeline parametrization, the radius can sometimes be
         # negative which is obviously not physical. If samples in that region
@@ -2386,14 +2490,14 @@ class GaussianMoffatPsfModel(PsfModel):
         return model
 
 
-class FourierExponentialPowerPsf(PsfModel):
+class ExponentialPowerPsfElement(PsfElement):
     """A Psf model element that has a profile in Fourier space of
     exp(-(width * w)**power).
 
     When power is 5/3, this is a Kolmogorov PSF.
     """
     def _setup_parameters(self):
-        super(FourierExponentialPowerPsf, self)._setup_parameters()
+        super(ExponentialPowerPsfElement, self)._setup_parameters()
 
         self._add_parameter('power', 1.6, (0., 2.), 'POW', 'power')
         self._add_parameter('width', 0.5, (0.01, 30.), 'WID', 'width')
