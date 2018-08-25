@@ -802,8 +802,8 @@ class SceneModel(object):
         if self.grid_info['grid_size'] != image.shape:
             raise PsfModelException(
                 'Image passed is a different size than the model is set up '
-                'for! Run psf_model.load_image() to set up the model for this '
-                'image size before whatever else you were trying to do.'
+                'for! Run scene_model.load_image() to set up the model for '
+                'this image size before whatever else you were trying to do.'
             )
 
         # Mask out invalid pixels.
@@ -990,6 +990,15 @@ class SceneModel(object):
         for key, value in kwargs.items():
             element = self.get_parameter_element(key)
             element[key] = value
+
+    def fix(self, **kwargs):
+        for key, value in kwargs.items():
+            element = self.get_parameter_element(key)
+            element.fix(**{key: value})
+
+    def _modify_parameter(self, name, **kwargs):
+        element = self.get_parameter_element(name)
+        element._modify_parameter(name, **kwargs)
 
     def clear_cache(self):
         """Clear the internal caches."""
@@ -1855,7 +1864,7 @@ class ModelElement(object):
 
         The exact behavior here will vary. Some examples are:
         - ModelComponent: adds new components in to the model (eg: a point
-          source)
+          source, a galaxy)
         - ConvolutionElement: convolves the model with something (eg: a PSF).
         - Pixelizer: pixelizes the model and removes subsampling to obtain real
           pixels.
@@ -1988,6 +1997,549 @@ class ModelElement(object):
         """Print info about the cache"""
         print("Hits: %d" % self._cache_hits)
         print("Misses: %d" % self._cache_misses)
+
+
+class MultipleImageFitter():
+    def __init__(self, scene_model, images, variances=None):
+        """Initialze a fitter for multiple images.
+
+        The fitter will fit a scene model to every image. scene_model is either
+        a previously set up SceneModel object, or a callable that generates a
+        SceneModel. If a previously set up SceneModel is passed, it will be
+        copied with copy.deepcopy for each image that is being fit.
+
+        images is a list of 2-dimensional images to be fit. variances should
+        have the same shape of images if it is specified.
+        """
+        scene_models = []
+        for index in range(len(images)):
+            image = images[index]
+            if variances is not None:
+                variance = variances[index]
+            else:
+                variance = None
+
+            if callable(scene_model):
+                new_scene_model = scene_model()
+            else:
+                new_scene_model = deepcopy(scene_model)
+
+            new_scene_model.load_image(image, variance)
+
+            scene_models.append(new_scene_model)
+
+        self._base_scene_model = scene_model
+        self.scene_models = scene_models
+
+        self._global_fit_parameters = OrderedDict()
+        self._global_fixed_parameters = OrderedDict()
+
+        self.fit_result = None
+
+    def fix(self, **kwargs):
+        """Fix a parameter to a specific value for all the models.
+
+        Each key is a parameter name, and either a single value or a list can
+        be specified for the key's value. If a single value is given, then
+        all images are set to that value. If a list is given, then the list
+        must have the same length as the number of images, and one entry will
+        be assigned to each image.
+        """
+        for key, value in kwargs.items():
+            if np.isscalar(value):
+                for scene_model in self.scene_models:
+                    scene_model.fix(**{key: value})
+                self._global_fixed_parameters[key] = value
+            else:
+                for scene_model, model_value in zip(self.scene_models, value):
+                    scene_model.fix(**{key: model_value})
+
+    def add_global_fit_parameter(self, name, initial_guess=None, bounds=None):
+        """Fix a parameter so that it is fit globally for all images"""
+
+        # If initial_guess or bounds is None, pull it from the first image.
+        if initial_guess is None:
+            initial_guess = self.scene_models[0]._parameter_info[name]['value']
+        if bounds is None:
+            bounds = self.scene_models[0]._parameter_info[name]['bounds']
+
+        new_parameter = {
+            'value': initial_guess,
+            'bounds': bounds,
+        }
+
+        self._global_fit_parameters[name] = new_parameter
+
+        for scene_model in self.scene_models:
+            scene_model._modify_parameter(name, fixed=True, **new_parameter)
+
+    def _get_fit_parameters(self, do_analytic_coefficients=True,
+                            apply_fit_scale=True):
+        """Return the information needed to do a fit with a flat parameter
+        vector (what scipy needs)
+
+        If do_analytic_coefficients is True, then parameters are analytically
+        solved for if possible (eg: amplitude, background) and aren't included
+        as fit parameters.
+
+        This method returns both an OrderedDict with the global parameter names
+        and parameter dictionaries, and a list of OrderedDicts with the
+        parameter information for each model as specified in
+        PsfModel._get_fit_parameters.
+        """
+        # Get the global parameter information. These are all used in the fit,
+        # so we can just use the dictionary that we have already.
+        global_parameters = self._global_fit_parameters
+
+        # Get the parameter information for each model.
+        individual_parameters = []
+        for scene_model in self.scene_models:
+            model_fit_parameters = scene_model._get_fit_parameters(
+                do_analytic_coefficients=do_analytic_coefficients,
+                apply_fit_scale=apply_fit_scale
+            )
+            individual_parameters.append(model_fit_parameters)
+
+        return global_parameters, individual_parameters
+
+    def chi_square(self, global_parameters={}, individual_parameters=None,
+                   do_analytic_coefficients=True, save_parameters=False,
+                   apply_fit_scale=False, apply_priors=True):
+        """Calculate the chi-square value for a given set of PSF parameters.
+
+        global_parameters is a dictionary of parameters that are passed to
+        every model.
+
+        individual_parameters is a list with the same length as the number of
+        models that are being fit. Each element of the list is a dictionary
+        with the parameters to pass to the corresponding model's chi_square
+        function.
+
+        If do_analytic_coefficients is True, then the parameters that represent
+        the scales of the model components are recalculated analytically.
+
+        If save_parameters is True, the underlying models are updated to save
+        the given parameters. Otherwise, they are unaffected.
+
+        If apply_fit_scale is True, then the individual images are scaled by a
+        predetermined amount that was calculated in _process_image, chosen such
+        that the amplitude of the PSF is ~1. See SceneModel.chi_square for
+        details.
+        """
+        if individual_parameters is None:
+            # Use the default individual parameters.
+            individual_parameters = [{} for i in range(len(self.scene_models))]
+
+        # Add any manually specified parameters to the internal ones.
+        global_parameters = dict(self.global_parameters, **global_parameters)
+
+        total_chi_square = 0
+
+        for scene_model, base_parameters in zip(self.scene_models,
+                                                individual_parameters):
+            parameters = dict(base_parameters, **global_parameters)
+
+            model_chi_square = scene_model.chi_square(
+                parameters,
+                do_analytic_coefficients=do_analytic_coefficients,
+                return_full_info=save_parameters,
+                apply_fit_scale=apply_fit_scale
+            )
+
+            if save_parameters:
+                model_chi_square, fit_model, full_parameters = model_chi_square
+                scene_model.set_parameters(update_derived=False,
+                                           **full_parameters)
+                scene_model.fit_model = fit_model
+
+            total_chi_square += model_chi_square
+
+        if apply_priors:
+            # TODO: priors
+            # prior_penalty = self.evaluate_priors(global_parameters)
+            # total_chi_square += prior_penalty
+            pass
+
+        if save_parameters:
+            # Save global parameters:
+            for parameter_name, value in global_parameters.items():
+                self._global_fit_parameters[parameter_name]['value'] = value
+
+        return total_chi_square
+
+    def evaluate_priors(self, parameters):
+        """Evaluate the priors that have been set"""
+        return _evaluate_priors(parameters, self._priors)
+
+    def _parse_start_fit_parameters(self, global_parameters,
+                                    individual_parameters):
+        """Parse fit parameters information and return a list of initial values
+        and bounds that can be passed to a fitter.
+        """
+        parameter_names = []
+        initial_values = []
+        all_bounds = []
+        scales = []
+
+        # Global parameters
+        for key, parameter_dict in global_parameters.items():
+            parameter_names.append(key)
+            initial_values.append(parameter_dict['value'])
+            all_bounds.append(parameter_dict['bounds'])
+            scales.append(1.)
+
+        # Individual parameters for each model
+        for index, model_dict in enumerate(individual_parameters):
+            for key, parameter_dict in model_dict.items():
+                initial_value = parameter_dict['value']
+                bounds = parameter_dict['bounds']
+                scale = parameter_dict['scale']
+
+                parameter_names.append('%s[%d]' % (key, index))
+                initial_values.append(initial_value)
+                all_bounds.append(bounds)
+                scales.append(scale)
+
+        initial_values = np.array(initial_values)
+
+        return parameter_names, initial_values, all_bounds, scales
+
+    def _map_fit_parameters(self, flat_parameters, global_parameters,
+                            individual_parameters):
+        """Map a flat array of fit parameters to what is needed to calculate a
+        chi-square.
+        """
+        index = 0
+
+        fit_global_parameters = {}
+        for key, parameter_dict in global_parameters.items():
+            fit_global_parameters[key] = flat_parameters[index]
+            index += 1
+
+        fit_individual_parameters = []
+        for model_parameters in individual_parameters:
+            fit_model_parameters = {}
+            for key, parameter_dict in model_parameters.items():
+                fit_model_parameters[key] = flat_parameters[index]
+                index += 1
+            fit_individual_parameters.append(fit_model_parameters)
+
+        return fit_global_parameters, fit_individual_parameters
+
+    def evaluate(self, *args, **kwargs):
+        """Evaluate each model and return a stacked array."""
+        models = []
+        for scene_model in self.scene_models:
+            model = scene_model.evaluate(*args, **kwargs)
+            models.append(model)
+        models = np.array(models)
+        return models
+
+    def fit(self, do_analytic_coefficients=True, verbose=False):
+        global_parameters, individual_parameters = \
+            self._get_fit_parameters(do_analytic_coefficients)
+
+        parameter_names, initial_values, bounds, scales = \
+            self._parse_start_fit_parameters(global_parameters,
+                                             individual_parameters)
+
+        def chi_square_flat(flat_parameters, save_parameters=False,
+                            apply_fit_scale=True):
+            flat_parameters = flat_parameters
+            fit_global_parameters, fit_individual_parameters = \
+                self._map_fit_parameters(flat_parameters, global_parameters,
+                                         individual_parameters)
+
+            chi_square = self.chi_square(
+                fit_global_parameters,
+                fit_individual_parameters,
+                do_analytic_coefficients=do_analytic_coefficients,
+                save_parameters=save_parameters,
+                apply_fit_scale=apply_fit_scale,
+            )
+
+            return chi_square
+
+        res = minimize(
+            chi_square_flat,
+            initial_values,
+            bounds=bounds,
+            jac=grad(chi_square_flat) if use_autograd else None,
+            method='L-BFGS-B',
+            options={'maxiter': 400, 'ftol': 1e-12},
+        )
+
+        if not res.success:
+            raise PsfModelException("Fit failed!", res.message)
+
+        # Retrieve the unscaled parameters and save them.
+        fit_parameters = res.x * scales
+        chi_square = chi_square_flat(fit_parameters, save_parameters=True,
+                                     apply_fit_scale=False)
+
+        self.fit_result = res
+        self.fit_initial_values = dict(zip(parameter_names, initial_values))
+        self.fit_chi_square = chi_square
+
+        if verbose:
+            self.print_fit_info()
+
+        # Return a fitted version of the PSF with global parameters fixed.
+        if callable(self._base_scene_model):
+            fit_scene_model = self._base_scene_model()
+        else:
+            fit_scene_model = deepcopy(self._base_scene_model)
+
+        grid_info = self.scene_models[0].grid_info
+        fit_scene_model.setup_grid(
+            grid_info['grid_size'],
+            grid_info['border'],
+            grid_info['subsampling']
+        )
+
+        fix_parameters = self._global_fixed_parameters.copy()
+        for name, parameter_dict in self._global_fit_parameters.items():
+            fix_parameters[name] = parameter_dict['value']
+        fit_scene_model.fix(**fix_parameters)
+
+        return fit_scene_model
+
+    def print_fit_info(self, title=None, uncertainties=True, verbosity=1):
+        """Print a diagnostic of the fit.
+
+        In uncertainties is set, then uncertainties will be printed out along
+        with the fit info. uncertainties can either be True (in which case they
+        are recalculated) or the output of a previous call to
+        self.calculate_uncertainties.
+        """
+        do_uncertainties = False
+        if self.fit_result is not None and uncertainties:
+            # Uncertainties will only make sense if we are at the minimum, so
+            # require that a fit has been done.
+            do_uncertainties = True
+            if uncertainties is True:
+                # Need to calculate them.
+                uncertainties = self.calculate_uncertainties()
+
+        initial_values = self.fit_initial_values
+        if initial_values is not None:
+            do_initial_values = True
+        else:
+            do_initial_values = False
+
+        print("="*70)
+
+        if title is not None:
+            print(title)
+            print("="*70)
+
+        if self.fit_result is not None:
+            print("%20s: %s" % ("Fit result", self.fit_result.message))
+            print("-"*70)
+
+        print("Global parameters:")
+
+        global_parameters, individual_parameters = \
+            self._get_fit_parameters(do_analytic_coefficients=False,
+                                     apply_fit_scale=False)
+
+        print_parameter_header(do_uncertainties, do_initial_values)
+
+        for parameter_name, parameter_dict in global_parameters.items():
+            print_dict = parameter_dict.copy()
+            if do_uncertainties and parameter_name in uncertainties:
+                print_dict['uncertainty'] = uncertainties[parameter_name]
+            if do_initial_values and parameter_name in initial_values:
+                print_dict['initial_value'] = initial_values[parameter_name]
+
+            print_parameter(parameter_name, print_dict, do_uncertainties,
+                            do_initial_values)
+
+        if verbosity >= 2:
+            print("-"*70)
+            print("Individual parameters:")
+
+            print_parameter_header(do_uncertainties, do_initial_values)
+
+            for idx, individual_dict in enumerate(individual_parameters):
+                for base_parameter_name, parameter_dict in \
+                        individual_dict.items():
+                    print_dict = parameter_dict.copy()
+                    if do_uncertainties and base_parameter_name in \
+                            uncertainties:
+                        uncertainty = uncertainties[base_parameter_name][idx]
+                        print_dict['uncertainty'] = uncertainty
+                    parameter_name = '%s[%d]' % (base_parameter_name, idx)
+                    if do_initial_values and parameter_name in initial_values:
+                        print_dict['initial_value'] = \
+                            initial_values[parameter_name]
+
+                    print_parameter(parameter_name, print_dict,
+                                    do_uncertainties, do_initial_values)
+
+        if self.fit_result is not None:
+            print("-"*70)
+            print("%20s: %g/%g" % ('chi2/dof', self.fit_result.fun,
+                                   self.degrees_of_freedom))
+
+        print("="*70)
+
+    def fit_and_fix_positions(self, **kwargs):
+        """Fit the positions of each scene with a Gaussian, and fix them for
+        future fits"""
+        print("TODO: make this work!")
+        for scene_model in self.scene_models:
+            scene_model.fit_and_fix_position(**kwargs)
+
+    def calculate_covariance(self, verbose=False, method='autograd' if
+                             use_autograd else 'finite_difference'):
+        """Estimate the covariance matrix using a numerical estimate of the
+        Hessian.
+
+        See scene_model.calculate_covariance for details.
+        """
+        global_parameters, individual_parameters = \
+            self._get_fit_parameters(do_analytic_coefficients=False)
+
+        parameter_names, parameter_values, bounds, scales = \
+            self._parse_start_fit_parameters(global_parameters,
+                                             individual_parameters)
+
+        def chi_square_flat(flat_parameters, save_parameters=False):
+            scaled_parameters = flat_parameters
+            fit_global_parameters, fit_individual_parameters = \
+                self._map_fit_parameters(scaled_parameters, global_parameters,
+                                         individual_parameters)
+
+            return self.chi_square(
+                fit_global_parameters,
+                fit_individual_parameters,
+                do_analytic_coefficients=False,
+                save_parameters=save_parameters,
+                apply_fit_scale=True,
+            )
+
+        if method == 'minuit':
+            cov = calculate_covariance_minuit(
+                chi_square_flat, parameter_names, parameter_values,
+                bounds=bounds, verbose=verbose
+            )
+        elif method == 'finite_difference':
+            cov = calculate_covariance_finite_difference(
+                chi_square_flat, parameter_names, parameter_values, bounds,
+                verbose=verbose,
+            )
+        elif method == 'autograd':
+            hess = hessian(chi_square_flat)(parameter_values)
+            cov = hessian_to_covariance(hess)
+        else:
+            raise PsfModelException('Unknown method %s' % method)
+
+        # Rescale amplitude and background parameters.
+        cov *= np.outer(scales, scales)
+
+        return parameter_names, cov
+
+    def plot_correlation(instance, names=None, covariance=None, **kwargs):
+        """Plot the correlation matrix between the fit parameters.
+
+        See _plot_correlation for details, this is just a wrapper around it.
+        """
+        _plot_correlation(instance, names, covariance, **kwargs)
+
+    def calculate_uncertainties(self, names=None, covariance=None, **kwargs):
+        """Estimate the uncertainties on all fit parameters.
+
+        This is done by calculating the full covariance matrix and returning a
+        dict matching parameters to the errors.
+
+        This method will throw a PsfModelException in the covariance matrix is
+        not well defined.
+
+        When fitting multiple images, terms that exist for every image are
+        given variable names like amplitude[5]. We restack those here to
+        give arrays.
+
+        If the covariance matrix has already been calculated, then it can be
+        passed in with the names and covariance parameters and it won't be
+        recalculated.
+        """
+        if covariance is not None:
+            if names is None:
+                raise PsfModelException(
+                    "Need to specify both names and covariance to used a "
+                    "previously-calculated covariance matrix!"
+                )
+        else:
+            names, covariance = self.calculate_covariance(**kwargs)
+
+        uncertainties = np.sqrt(np.diag(covariance))
+
+        array_keys = []
+
+        result = {}
+        for name, uncertainty in zip(names, uncertainties):
+            if name[-1] == ']':
+                # Part of an array. The elements will always be in order, so
+                # we can just split on the [ character.
+                key = name.split('[')[0]
+                if key not in result:
+                    array_keys.append(key)
+                    result[key] = []
+                result[key].append(uncertainty)
+            else:
+                result[name] = uncertainty
+
+        for key in array_keys:
+            result[key] = np.array(result[key])
+
+        return result
+
+    @property
+    def global_parameters(self):
+        """Return the current value of all of the global parameters"""
+        global_parameters = {}
+
+        for name, parameter_dict in self._global_fit_parameters.items():
+            global_parameters[name] = parameter_dict['value']
+
+        return global_parameters
+
+    @property
+    def parameters(self):
+        """Return the current value of all parameters that were included in the
+        fit.
+        """
+        global_parameters, individual_parameters = \
+            self._get_fit_parameters(do_analytic_coefficients=False)
+
+        parameters = {}
+
+        for name, parameter_dict in global_parameters.items():
+            parameters[name] = parameter_dict['value']
+
+        individual_keys = individual_parameters[0].keys()
+        for key in individual_keys:
+            values = []
+            for individual_dict in individual_parameters:
+                values.append(individual_dict[key]['value'])
+            values = np.array(values)
+            parameters[key] = values
+
+        return parameters
+
+    @property
+    def degrees_of_freedom(self):
+        """Calculate how many degrees of freedom there are in the fit"""
+        # Figure out how many degrees of freedom are present in each sub-model
+        dof = 0
+        for scene_model in self.scene_models:
+            dof += scene_model.degrees_of_freedom
+
+        # Remove global fit parameters
+        dof -= len(self._global_fit_parameters)
+
+        return dof
 
 
 class SubsampledModelElement(ModelElement):
