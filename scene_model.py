@@ -577,7 +577,7 @@ class SceneModel(object):
     Finally, the Background element adds a background component to the model.
     """
     def __init__(self, elements, image=None, variance=None, grid_size=None,
-                 subsampling=3, border=15, **kwargs):
+                 subsampling=3, border=15, shared_parameters=[], **kwargs):
         """Initialize a scene model.
 
         elements is a list of either ModelElement classes or instances which
@@ -608,6 +608,7 @@ class SceneModel(object):
         self.border = border
 
         self.elements = []
+        self.shared_parameters = shared_parameters
 
         for element in elements:
             if not isinstance(element, ModelElement):
@@ -620,13 +621,20 @@ class SceneModel(object):
             model_parameters = self.parameters
             for parameter in element._parameter_info:
                 if parameter in model_parameters:
+                    if parameter in self.shared_parameters:
+                        # This parameter is a shared parameter and it has
+                        # already been added by another element. This is fine.
+                        continue
+
                     raise PsfModelException(
                         "Model has two parameters with the name %s! (second "
-                        " in %s). Add a prefix with "
-                        "ModelElement(prefix='my_prefix') if necessary." %
-                        (parameter, element)
+                        " in %s). Either add a prefix with "
+                        "ModelElement(prefix='my_prefix') for two separate "
+                        "parameters or add this to the shared_parameters list."
+                        % (parameter, element)
                     )
 
+            # Everything looks ok, add the element.
             self.elements.append(element)
 
         if image is not None:
@@ -905,10 +913,14 @@ class SceneModel(object):
 
     @property
     def parameters(self):
-        """Return a list of the current parameter values."""
+        """Return a list of the current parameter values.
+        """
         full_parameters = OrderedDict()
         for element in self.elements:
-            full_parameters.update(element.parameters)
+            for name, value in element.parameters.items():
+                # Use the first entry for shared parameters
+                if name not in full_parameters:
+                    full_parameters[name] = value
 
         return full_parameters
 
@@ -916,10 +928,15 @@ class SceneModel(object):
     def _parameter_info(self):
         """Return an ordered dictionary of the full information for each of the
         parameters.
+
+        See SceneModel.parameters for details on the ordering.
         """
         parameter_info = OrderedDict()
         for element in self.elements:
-            parameter_info.update(element._parameter_info)
+            for name, parameter_dict in element._parameter_info.items():
+                # Use the first entry for shared parameters
+                if name not in parameter_info:
+                    parameter_info[name] = parameter_dict
 
         return parameter_info
 
@@ -930,7 +947,10 @@ class SceneModel(object):
         """
         coefficients = OrderedDict()
         for element in self.elements:
-            coefficients.update(element.coefficients)
+            for name, value in element.coefficients.items():
+                # Use the first entry for shared parameters
+                if name not in coefficients:
+                    coefficients[name] = value
 
         return coefficients
 
@@ -941,7 +961,10 @@ class SceneModel(object):
         """
         coefficient_info = OrderedDict()
         for element in self.elements:
-            coefficient_info.update(element._coefficient_info)
+            for name, parameter_dict in element._coefficient_info.items():
+                # Use the first entry for shared parameters
+                if name not in coefficient_info:
+                    coefficient_info[name] = parameter_dict
 
         return coefficient_info
 
@@ -976,6 +999,14 @@ class SceneModel(object):
             model = 0.
         mode = None
 
+        # Add in any shared parameters if they aren't explicitly in the
+        # parameters dictionary.
+        for parameter_name in self.shared_parameters:
+            element = self.get_parameter_element(parameter_name)
+            value = element._extract_parameter(parameters, parameter_name,
+                                               apply_prefix=False)
+            parameters.update({parameter_name: value})
+
         for element in self.elements:
             model, mode, parameters = element._update_model(
                 grid_info, model, mode, separate_components,
@@ -997,7 +1028,8 @@ class SceneModel(object):
     def set_parameters(self, update_derived=True, **kwargs):
         for key, value in kwargs.items():
             element = self.get_parameter_element(key)
-            element[key] = value
+            element.set_parameters(update_derived=update_derived,
+                                   **{key: value})
 
     def fix(self, **kwargs):
         for key, value in kwargs.items():
@@ -1006,7 +1038,7 @@ class SceneModel(object):
 
     def _modify_parameter(self, name, **kwargs):
         element = self.get_parameter_element(name)
-        element._modify_parameter(name, **kwargs)
+        element._modify_parameter(name, apply_prefix=False, **kwargs)
 
     def clear_cache(self):
         """Clear the internal caches."""
@@ -1701,8 +1733,8 @@ class ModelElement(object):
         self._setup_parameters()
 
     def _add_parameter(self, name, value, bounds, fits_keyword=None,
-                       fits_description=None, fixed=False, coefficient=False,
-                       derived=False):
+                       fits_description=None, fixed=False, apply_prefix=True,
+                       coefficient=False, derived=False):
         """Add a parameter to the model."""
         new_parameter = {
             'value': value,
@@ -1710,11 +1742,12 @@ class ModelElement(object):
             'fixed': fixed,
             'coefficient': coefficient,
             'derived': derived,
+            'apply_prefix': apply_prefix,
             'fits_keyword': fits_keyword,
             'fits_description': fits_description,
         }
 
-        if self.prefix is not None:
+        if apply_prefix and self.prefix is not None:
             name = '%s_%s' % (self.prefix, name)
 
         self._parameter_info[name] = new_parameter
@@ -1727,12 +1760,30 @@ class ModelElement(object):
         """
         pass
 
-    def _modify_parameter(self, name, **kwargs):
+    def _apply_prefix(self, name):
+        """Apply a prefix if needed to a parameter name"""
+        if self.prefix is None:
+            # Nothing to do.
+            return name
+
+        if (name in self._parameter_info and
+                self._parameter_info[name]['apply_prefix'] is False):
+            # Shouldn't add a prefix to this parameter
+            return name
+
+        name = '%s_%s' % (self.prefix, name)
+
+        return name
+
+    def _modify_parameter(self, name, apply_prefix=True, **kwargs):
         """Modify a parameter"""
         if 'derived' in kwargs and kwargs['derived'] is True:
             # When we change a parameter to derived, unset its value since it
             # is no longer applicable.
             kwargs['value'] = None
+
+        if apply_prefix:
+            name = self._apply_prefix(name)
 
         self._parameter_info[name].update(kwargs)
 
@@ -1889,7 +1940,7 @@ class ModelElement(object):
 
         return model, mode, full_parameters
 
-    def _extract_parameter(self, parameter_dict, name, add_prefix=True):
+    def _extract_parameter(self, parameter_dict, name, apply_prefix=True):
         """Retrieve a parameter from a dictionary of parameters.
 
         If the parameter isn't in the dictionary, then it is pulled from the
@@ -1897,10 +1948,13 @@ class ModelElement(object):
 
         If the ModelElement class was initialized with a prefix, this method
         adds the prefix in to make the prefix transparent to the calling
-        function. To avoid this, pass add_prefix=False.
+        function. To avoid this, pass apply_prefix=False.
         """
-        if add_prefix and self.prefix is not None:
-            name = '%s_%s' % (self.prefix, name)
+        if apply_prefix:
+            name = self._apply_prefix(name)
+
+        if name not in self._parameter_info:
+            raise PsfModelException("Unknown parameter %s for %s!" % (self))
 
         if name in parameter_dict:
             return parameter_dict[name]
@@ -1918,6 +1972,22 @@ class ModelElement(object):
                                                   **kwargs))
 
         return result
+
+    def _update_parameter_dict(self, parameter_dict, apply_prefix=True,
+                               **kwargs):
+        """Update a dictionary of parameters with new values.
+
+        If the ModelElement class was initialized with a prefix, this method
+        adds the prefix in to make the prefix transparent to the calling
+        function. To avoid this, pass apply_prefix=False.
+        """
+        for name, value in kwargs.items():
+            if apply_prefix:
+                name = self._apply_prefix(name)
+
+            parameter_dict[name] = value
+
+        return parameter_dict
 
     def get_cache(self, item, calculator, **kwargs):
         """Use a cache to avoid reevaluating parts of an element that don't
@@ -2346,7 +2416,7 @@ class MultipleImageFitter():
             print("%20s: %s" % ("Fit result", self.fit_result.message))
             print("-"*70)
 
-        print("Global parameters:")
+        print("Global parameters:\n")
 
         global_parameters, individual_parameters = \
             self._get_fit_parameters(do_analytic_coefficients=False,
@@ -2366,7 +2436,7 @@ class MultipleImageFitter():
 
         if verbosity >= 2:
             print("-"*70)
-            print("Individual parameters:")
+            print("Individual parameters:\n")
 
             print_parameter_header(do_uncertainties, do_initial_values)
 
@@ -2642,7 +2712,7 @@ class SubsampledModelElement(ModelElement):
         """
         parameter_names = self._parameter_info.keys()
         values = self._extract_parameters(parameters, *parameter_names,
-                                          add_prefix=False)
+                                          apply_prefix=False)
         cache_parameters = dict(zip(parameter_names, values))
 
         if mode == 'fourier':
@@ -3074,46 +3144,278 @@ class ExponentialPowerPsfElement(PsfElement):
         return fourier_profile
 
 
-def generate_snifs_psf_elements():
-    # Gaussian instrumental core
-    inst_core_element = GaussianPsfElement(prefix='inst_core')
-    inst_core_element.fix(
-        inst_core_sigma_x=0.2376935 / np.sqrt(2.),
-        inst_core_sigma_y=0.154173 / np.sqrt(2.),
-        inst_core_rho=0.,
-    )
+class ChromaticExponentialPowerPsfElement(ExponentialPowerPsfElement):
+    """A chromatic ExponentialPowerPsfElement to represent seeing.
 
-    # Exponential power function for instrumental wings
-    inst_wings_element = ExponentialPowerPsfElement(prefix='inst_wings')
-    inst_wings_element.fix(
-        inst_wings_power=1.07,
-        inst_wings_width=0.209581,
-    )
+    The width of the PSF takes the form:
 
-    # Seeing
-    seeing_element = ExponentialPowerPsfElement(prefix='seeing')
-    seeing_element.fix(
-        seeing_power=1.52,
-    )
+        width = ref_width * (wave / ref_wave) ** (ref_power)
+    """
+    def _setup_parameters(self):
+        super(ChromaticExponentialPowerPsfElement, self)._setup_parameters()
 
-    # Tracking
-    tracking_element = GaussianPsfElement(prefix='tracking')
-    tracking_element.fix(
-        tracking_rho=0.99
-    )
-    tracking_element._modify_parameter('tracking_sigma_x', value=0.1,
-                                       bounds=(-30., 30.))
-    tracking_element._modify_parameter('tracking_sigma_y', value=0.1,
-                                       bounds=(-30., 30.))
+        # Width is now a derived parameter
+        self._modify_parameter('width', derived=True)
 
-    elements = [
-        PointSource,
-        Background,
-        inst_core_element,
-        inst_wings_element,
-        seeing_element,
-        tracking_element,
-        Pixelizer,
-    ]
+        self._add_parameter('wavelength', None, (None, None), 'WAVE',
+                            'wavelength [A]', fixed=True, apply_prefix=False)
+        self._add_parameter('ref_width', 1., (0.01, 30.), 'RWID',
+                            'width at reference wavelength')
+        self._add_parameter('ref_power', -0.3, (-2., 2.), 'RPOW',
+                            'powerlaw power')
 
-    return elements
+    def _calculate_derived_parameters(self, parameters):
+        """Calculate the seeing width parameter using a power-law in wavelength
+        """
+        wavelength, ref_width, ref_power = self._extract_parameters(
+            parameters, 'wavelength', 'ref_width', 'ref_power',
+        )
+
+        # Ensure that all required variables have been set properly.
+        if wavelength is None:
+            raise PsfModelException("Must set wavelength!")
+
+        width = (
+            ref_width * (wavelength / reference_wavelength)**ref_power
+        )
+
+        # Add in the new parameters
+        parameters = self._update_parameter_dict(parameters, width=width)
+
+        # Update parameters from the superclass
+        parent_parameters = super(ChromaticExponentialPowerPsfElement, self).\
+            _calculate_derived_parameters(parameters)
+
+        return parent_parameters
+
+
+class SnifsAdrElement(ConvolutionElement):
+    """A PsfElement that applies atmospheric differential refraction to a
+    scene.
+    """
+    def __init__(self, adr_model=None, spaxel_size=None, pressure=None,
+                 temperature=None, **kwargs):
+        super(SnifsAdrElement, self).__init__(**kwargs)
+
+        if adr_model is not None:
+            self.set_adr(adr_model, spaxel_size)
+        elif pressure is not None:
+            self.load_adr(pressure, temperature, spaxel_size)
+        else:
+            # Will be set up later.
+            self.adr_model = None
+            self.spaxel_size = None
+
+    def _setup_parameters(self):
+        """Setup ADR parameters
+
+        The ADR model has delta and theta parameters that determine the
+        wavelength variation of the position. We also need to specify the
+        position at a reference wavelength to set the zeropoint of the model.
+        """
+        super(SnifsAdrElement, self)._setup_parameters()
+
+        self._add_parameter('wavelength', None, (None, None), 'WAVE',
+                            'wavelength [A]', fixed=True, apply_prefix=False)
+
+        self._add_parameter('adr_delta', 1., (0., 100.), 'DELTA',
+                            'ADR delta parameter')
+        self._add_parameter('adr_theta', 0., (None, None), 'THETA',
+                            'ADR theta parameter')
+
+    def _evaluate_fourier(self, wx, wy, subsampling, **parameters):
+        wavelength, adr_delta, adr_theta = self._extract_parameters(
+            parameters, 'wavelength', 'adr_delta', 'adr_theta'
+        )
+
+        if wavelength is None:
+            raise PsfModelException("Must set wavelength for %s!" % type(self))
+        if self.adr_model is None:
+            raise PsfModelException("Must setup the ADR model for %s!" %
+                                    type(self))
+
+        adr_scale = self.adr_model.get_scale(wavelength) / self.spaxel_size
+
+        shift_x = adr_delta * np.sin(adr_theta) * adr_scale
+        shift_y = -adr_delta * np.cos(adr_theta) * adr_scale
+
+        shift_fourier = np.exp(-1j * (shift_x * wx + shift_y * wy))
+
+        return shift_fourier
+
+    def set_adr(self, adr_model, spaxel_size):
+        """Set the ADR model to one that has already been created."""
+        # Make sure that we passed both the adr model and the spaxel size
+        if adr_model is None or spaxel_size is None:
+            raise PsfModelException(
+                "If specifying a previously set up adr model, must also "
+                "specify the spaxel size."
+            )
+
+        self.adr_model = adr_model
+        self.spaxel_size = spaxel_size
+
+    def load_adr(self, pressure, temperature, spaxel_size):
+        """Load an ADR model for the PSF."""
+
+        if pressure is None or temperature is None or spaxel_size is None:
+            raise PsfModelException(
+                "Must specify all of pressure, temperature and spaxel_size."
+            )
+
+        from ToolBox.Atmosphere import ADR
+        self.adr_model = ADR(pressure, temperature)
+        self.spaxel_size = spaxel_size
+
+
+class TrackingEllipticityPsfElement(PsfElement):
+    """A PsfElement that represents non-chromatic ellipticity due to effects
+    like tracking or wind-shake
+
+    Effects like bad tracking and windshake effectively convolve the PSF with a
+    Gaussian-like profile that is wavelength-independent. In practice, for
+    SNIFS, we find that these effects mostly occur in one specific direction
+    (typically the Y-direction), and the Gaussian in the convolution has a much
+    longer major-axis compared to the minor-axis. We are unable to measure both
+    the minor axis and the seeing separately with SNIFS, and we assume that the
+    minor axis is infinitesimally small in order to proceed. The major axis is
+    then defined by two points in Cartesian space that specify the width and
+    angle. Angles are difficult for fitters as they lead to singularities when
+    the width is near zero, so we fit the ellipticity with the two points in
+    Cartesian space directly, and we expose the resulting angle and width as
+    derived parameters.
+
+    Note that this definition means that flipping the signs of both the X and Y
+    coordinates leads to the same model, so there is a degeneracy. The
+    ellipticity is almost always aligned with one of the axes, so we don't want
+    to put bounds near the axes. To handle this, we initialize the fitter at
+    (0.1, 0.1) which almost always means that the fitter ends up either
+    choosing the (+1, 0) direction or the (0, +1) direction.
+    """
+    def _setup_parameters(self):
+        super(TrackingEllipticityPsfElement, self)._setup_parameters()
+
+        self._add_parameter('ell_coord_x', 0.1, (-30., 30.), 'ELLX',
+                            'Ellipticity coordinate in X direction')
+        self._add_parameter('ell_coord_y', 0.1, (-30., 30.), 'ELLY',
+                            'Ellipticity coordinate in Y direction')
+        self._add_parameter('ell_angle', None, (None, None), 'ELLA',
+                            'Ellipticity angle (deg)', derived=True)
+        self._add_parameter('ell_width', None, (None, None), 'ELLW',
+                            'Ellipticity width', derived=True)
+
+    def _calculate_derived_parameters(self, parameters):
+        p = parameters.copy()
+
+        p['ell_angle'] = (np.arctan2(p['ell_coord_y'], p['ell_coord_x']) *
+                          180. / np.pi)
+        p['ell_width'] = np.sqrt(p['ell_coord_x']**2 + p['ell_coord_y']**2)
+
+        # Update parameters from the superclass
+        parent_parameters = super(TrackingEllipticityPsfElement, self).\
+            _calculate_derived_parameters(p)
+
+        return parent_parameters
+
+    def _evaluate_fourier(self, wx, wy, subsampling, **parameters):
+        ell_coord_x, ell_coord_y = self._extract_parameters(
+            parameters, 'ell_coord_x', 'ell_coord_y',
+        )
+
+        # Infinitesimally small minor axis
+        rho = 0.99
+
+        gaussian = np.exp(-0.5 * (
+            wx**2 * ell_coord_x**2 +
+            wy**2 * ell_coord_y**2 +
+            2. * wx * wy * rho * ell_coord_x * ell_coord_y
+        ))
+
+        return gaussian
+
+
+class SnifsFourierSceneModel(SceneModel):
+    """A model of the PSF for the SNIFS IFU.
+
+    This model was empirically determined, and it contains:
+    - a Gaussian instrumental core
+    - a wide tail for the instrumental core
+    - a Kolmogorov-like seeing term (with a variable exponent that doesn't
+    quite match the Kolmogorov prediction).
+    - a term to capture the tracking and wind-shake jitter seen in SNIFS
+    exposures.
+    - a background
+
+    The model can optionally be specified with wavelength dependence, in which
+    case an ADR model is used to determine the position of the point source as
+    a function of wavelength and a power law is used to determine the seeing
+    variation with wavelength.
+    """
+    def __init__(self, image=None, variance=None, grid_size=None,
+                 subsampling=3, border=15, use_empirical_parameters=True,
+                 wavelength_dependence=True, adr_model=None, spaxel_size=None,
+                 pressure=None, temperature=None, **kwargs):
+        """Build the elements of the PSF model.
+
+        If use_empirical_parameters is True, then the instrumental parameters
+        and the seeing power are set to empirically fitted parameters
+        determined from the whole SNfactory standard star dataset.
+        """
+
+        elements = [
+            PointSource,
+            Background
+        ]
+
+        # Gaussian instrumental core
+        inst_core_element = GaussianPsfElement(prefix='inst_core')
+        elements.append(inst_core_element)
+
+        # Exponential power function for instrumental wings
+        inst_wings_element = ExponentialPowerPsfElement(prefix='inst_wings')
+        elements.append(inst_wings_element)
+
+        # ADR
+        if wavelength_dependence:
+            adr_element = SnifsAdrElement(
+                adr_model=adr_model, spaxel_size=spaxel_size,
+                pressure=pressure, temperature=temperature
+            )
+            elements.append(adr_element)
+
+        # Seeing
+        if wavelength_dependence:
+            seeing_element = ChromaticExponentialPowerPsfElement(
+                prefix='seeing'
+            )
+        else:
+            seeing_element = ExponentialPowerPsfElement(prefix='seeing')
+        elements.append(seeing_element)
+
+        # Tracking
+        tracking_element = TrackingEllipticityPsfElement()
+        elements.append(tracking_element)
+
+        # Pixelize
+        elements.append(Pixelizer)
+
+        super(SnifsFourierSceneModel, self).__init__(
+            elements=elements,
+            image=image,
+            variance=variance,
+            grid_size=grid_size,
+            subsampling=subsampling,
+            border=border,
+            shared_parameters=['wavelength'],
+            **kwargs
+        )
+
+        if use_empirical_parameters:
+            self.fix(
+                inst_core_sigma_x=0.1680747,
+                inst_core_sigma_y=0.1090168,
+                inst_core_rho=0.,
+                inst_wings_power=1.07,
+                inst_wings_width=0.209581,
+                seeing_power=1.52,
+            )
