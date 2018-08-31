@@ -34,6 +34,14 @@ use_autograd = False
 # Use a constant reference wavelength for easy comparisons.
 reference_wavelength = 5000.
 
+default_subsampling = 3
+default_border = 15
+
+## Debug flags. Enable to get a lot of output
+
+# Show all Fourier transformations.
+debug_fourier = False
+
 ###############################################################################
 # End of configuration.
 ###############################################################################
@@ -510,6 +518,9 @@ def _real_to_fourier(real_components, grid_info):
     This can handle either single components or lists of multiple
     components.
     """
+    if debug_fourier:
+        print("--  Applying FFT")
+
     if len(np.shape(real_components)) == 2:
         # Single element
         single = True
@@ -537,6 +548,9 @@ def _fourier_to_real(fourier_components, grid_info):
     This can handle either single components or lists of multiple
     components.
     """
+    if debug_fourier:
+        print("--  Applying IFFT")
+
     if len(np.shape(fourier_components)) == 2:
         # Single element
         single = True
@@ -558,6 +572,68 @@ def _fourier_to_real(fourier_components, grid_info):
         return real_components
 
 
+class DumbLRUCache(object):
+    """Dumb LRU cache
+
+    This caches the last max_size calls to a function. When the cache is full,
+    the least recently used call is discarded.
+
+    In Python3 there is an lru_cache decorator in the standard library, but
+    that doesn't exist in Python2 so I wrote this simple class. It is dumb, and
+    not optimized at all, but it works.
+    """
+    def __init__(self, max_size=20):
+        self.max_size = max_size
+        self.cache = []
+
+        self.hits = 0
+        self.misses = 0
+
+    def __getitem__(self, key):
+        """Return the cache value for a given key.
+
+        This returns None in the key wasn't in the cache. The item is also
+        moved to the back of the cache. We manually check each key against the
+        cache, so the key doesn't need to be hashable. This isn't optimal for
+        many use cases, but I want to use this for dicts and it works well for
+        that.
+        """
+        for index, (cache_key, value) in enumerate(self.cache):
+            if key == cache_key:
+                # Found it. Move the entry to the end of the cache.
+                self.cache.append(self.cache.pop(index))
+
+                # Return the value
+                self.hits += 1
+                return value
+
+        # Not in the cache
+        self.misses += 1
+        return None
+
+    def __setitem__(self, key, value):
+        """Add a value to the cache."""
+        # Make sure that the item isn't in the cache already. Ideally I would
+        # write something that does the getting and setting together, but I
+        # didn't.
+        test_value = self[key]
+        if test_value is not None:
+            raise PsfModelException(
+                "key %s is already in the cache. This shouldn't happen!" % key
+            )
+
+        # Add the item
+        self.cache.append((key, value))
+
+        # Keep the cache within the maximum size.
+        if len(self.cache) > self.max_size:
+            self.cache.pop(0)
+
+    def clear(self):
+        """Clear the cache"""
+        self.cache = []
+
+
 class SceneModel(object):
     """Model of a scene.
 
@@ -577,7 +653,8 @@ class SceneModel(object):
     Finally, the Background element adds a background component to the model.
     """
     def __init__(self, elements, image=None, variance=None, grid_size=None,
-                 subsampling=3, border=15, shared_parameters=[], **kwargs):
+                 subsampling=default_subsampling, border=default_border,
+                 shared_parameters=[], **kwargs):
         """Initialize a scene model.
 
         elements is a list of either ModelElement classes or instances which
@@ -601,8 +678,7 @@ class SceneModel(object):
         self.fit_result = None
         self.fit_initial_values = None
 
-        self._chi_square_cache_hits = 0
-        self._chi_square_cache_misses = 0
+        self._chi_square_cache = DumbLRUCache()
 
         self.subsampling = subsampling
         self.border = border
@@ -767,8 +843,20 @@ class SceneModel(object):
         self.clear_cache()
 
     def load_image(self, image, variance=None, saturation_level=None,
-                   guess_position=True, apply_scale=True):
-        """Load an image to fit"""
+                   apply_scale=True, set_initial_guesses=True,
+                   amplitude_key='amplitude', background_key='background',
+                   center_x_key='center_x', center_y_key='center_y'):
+        """Load an image to fit.
+        
+        This will load an image and guess some of the initial values.
+        SceneModel_process_image will estimate the brightness and position of
+        the brightest source in the image. If set_initial_guesses is set, these
+        will be used to initialize the parameters of the model. By default, the
+        center_x, center_y, amplitude and background parameters are set. These
+        keywords can be changed with the parameters to this function. If some
+        of these parameters don't exist in the model, then they are simply not
+        set.
+        """
         # Build a grid of x and y coordinates for the image
         self.setup_grid(image.shape)
 
@@ -788,25 +876,30 @@ class SceneModel(object):
         self.fit_initial_values = None
 
         # Set the initial amplitude and background parameters from the estimate
-        self.set_parameters(
-            amplitude=image_fit_data['amplitude_guess'],
-            background=image_fit_data['background_guess'],
-            update_derived=False,
-        )
+        if set_initial_guesses:
+            guess_map = {
+                amplitude_key: 'amplitude_guess',
+                background_key: 'background_guess',
+                center_x_key: 'center_x_guess',
+                center_y_key: 'center_y_guess',
+            }
 
-        # Figure out where the center should be with a first moment.
-        if guess_position:
-            self.set_parameters(
-                center_x=image_fit_data['center_x_guess'],
-                center_y=image_fit_data['center_y_guess']
-            )
+            for parameter_name, guess_name in guess_map.items():
+                if parameter_name in self._parameter_info:
+                    self[parameter_name] = image_fit_data[guess_name]
 
     def _process_image(self, image, variance=None, saturation_level=None,
                        background_fraction=0.5):
-        """Process an image to remove invalid pixels.
+        """Process an image to select valid pixels and estimate scales.
 
-        This returns a dictionary with x-positions, y-positions, image values,
-        variances and the mask that was used.
+        This returns a dictionary with all of the relevant information from the
+        image. Masked arrays for the image, variance and x and y coordinates
+        are all included in this array.
+
+        Additionally, this method estimates the brightness of the brightest
+        object in the image. This is used to set a rough scale for the image
+        when fitting (so that the amplitudes are O(1)). The position of that
+        brightest object is also estimated.
 
         If variance is not specified, then a flat variance level is estimated
         for this image (equivalent to least-squares)
@@ -897,11 +990,13 @@ class SceneModel(object):
         result = {
             'image': image,
             'variance': variance,
+
+            'mask': mask,
             'mask_x': mask_x,
             'mask_y': mask_y,
             'mask_data': mask_data,
             'mask_variance': mask_variance,
-            'mask': mask,
+
             'scale': scale,
             'amplitude_guess': amplitude_guess,
             'background_guess': background_guess,
@@ -915,7 +1010,7 @@ class SceneModel(object):
     def parameters(self):
         """Return a list of the current parameter values.
         """
-        full_parameters = OrderedDict()
+        full_parameters = dict()
         for element in self.elements:
             for name, value in element.parameters.items():
                 # Use the first entry for shared parameters
@@ -945,7 +1040,7 @@ class SceneModel(object):
         """Return an ordered dictionary of the coefficient parameters that
         scale each component of the model.
         """
-        coefficients = OrderedDict()
+        coefficients = dict()
         for element in self.elements:
             for name, value in element.coefficients.items():
                 # Use the first entry for shared parameters
@@ -979,7 +1074,7 @@ class SceneModel(object):
 
     def evaluate(self, grid_info=None, separate_components=False,
                  apply_coefficients=True, return_full_parameters=False,
-                 **parameters):
+                 apply_mask=False, **parameters):
         """Evaluate the scene model with the given parameters.
 
         This adds in the amplitude and background to the PSF model that comes
@@ -1004,14 +1099,24 @@ class SceneModel(object):
         for parameter_name in self.shared_parameters:
             element = self.get_parameter_element(parameter_name)
             value = element._extract_parameter(parameters, parameter_name,
-                                               apply_prefix=False)
-            parameters.update({parameter_name: value})
+                                               model_name=True)
+            parameters[parameter_name] = value
 
         for element in self.elements:
+            if debug_fourier:
+                print(type(element).__name__)
+
+            old_mode = mode
             model, mode, parameters = element._update_model(
-                grid_info, model, mode, separate_components,
-                apply_coefficients, **parameters
+                grid_info, model, mode, parameters, separate_components,
+                apply_coefficients
             )
+
+            if debug_fourier:
+                print("    %s -> %s" % (old_mode, mode))
+
+        if debug_fourier:
+            print("")
 
         # Warn the user if we don't end up with a pixelated image in the end.
         # If the image isn't pixelized, then something went wrong and the
@@ -1019,6 +1124,10 @@ class SceneModel(object):
         if mode != 'pixel':
             print("WARNING: SceneModel didn't produce a pixelated image! Got "
                   "%s instead" % mode)
+
+        if apply_mask:
+            # Apply the fit mask for this image
+            model = model[self.fit_mask]
 
         if return_full_parameters:
             return model, parameters
@@ -1031,6 +1140,15 @@ class SceneModel(object):
             element.set_parameters(update_derived=update_derived,
                                    **{key: value})
 
+    def __getitem__(self, parameter):
+        """Return the value of a given parameter"""
+        element = self.get_parameter_element(parameter)
+        return element[parameter]
+
+    def __setitem__(self, parameter, value):
+        """Set the value of a given parameter"""
+        self.set_parameters(**{parameter: value})
+
     def fix(self, **kwargs):
         for key, value in kwargs.items():
             element = self.get_parameter_element(key)
@@ -1038,12 +1156,12 @@ class SceneModel(object):
 
     def _modify_parameter(self, name, **kwargs):
         element = self.get_parameter_element(name)
-        element._modify_parameter(name, apply_prefix=False, **kwargs)
+        element._modify_parameter(name, model_name=True, **kwargs)
 
     def clear_cache(self):
         """Clear the internal caches."""
         # Cache of the chi square output.
-        self._chi_square_cache = None
+        self._chi_square_cache.clear()
 
         for element in self.elements:
             element.clear_cache()
@@ -1077,21 +1195,18 @@ class SceneModel(object):
                     do_cache = False
                     break
 
-        cache = self._chi_square_cache
-        call_info = {
-            'parameters': parameters,
-            'return_full_info': return_full_info,
-            'do_analytic_coefficients': do_analytic_coefficients,
-            'apply_fit_scale': apply_fit_scale,
-            'apply_priors': apply_priors,
-        }
-        if (do_cache
-                and cache is not None
-                and cache['call_info'] == call_info):
-            # Hit the cache
-            self._chi_square_cache_hits += 1
-            return cache['return_val']
-        self._chi_square_cache_misses += 1
+        if do_cache:
+            # Check if these parameters are in the LRU cache
+            call_info = {
+                'parameters': parameters,
+                'return_full_info': return_full_info,
+                'do_analytic_coefficients': do_analytic_coefficients,
+                'apply_fit_scale': apply_fit_scale,
+                'apply_priors': apply_priors,
+            }
+            cache_value = self._chi_square_cache[call_info]
+            if cache_value is not None:
+                return cache_value
 
         # Get the data to use in the chi square evaluation, and scale it if
         # desired.
@@ -1147,10 +1262,7 @@ class SceneModel(object):
 
         # Update the cache
         if do_cache:
-            self._chi_square_cache = {
-                'call_info': call_info,
-                'return_val': return_val,
-            }
+            self._chi_square_cache[call_info] = return_val
 
         return return_val
 
@@ -1471,6 +1583,7 @@ class SceneModel(object):
             print("-"*70)
             print("%20s: %g/%g" % ('chi2/dof', self.fit_result.fun,
                                    self.degrees_of_freedom))
+            print("%20s: %d" % ('nfev', self.fit_result.nfev))
 
         print("="*70)
 
@@ -1496,9 +1609,13 @@ class SceneModel(object):
 
         # Start with a point source at the center of the image.
         point_source = PointSource()
+        point_source_parameters = {
+            'center_x': 0.,
+            'center_y': 0.,
+            'amplitude': 1.
+        }
         model, mode, point_source_parameters = point_source._update_model(
-            grid_info, 0., None, False, True, center_x=0., center_y=0.,
-            amplitude=1.
+            grid_info, 0., None, point_source_parameters, False, True
         )
 
         # Use the current model parameters as a base, but override with
@@ -1510,7 +1627,7 @@ class SceneModel(object):
             # convolution of all of those elements.
             if isinstance(element, PsfElement):
                 model, mode, parameters = element._update_model(
-                    grid_info, model, mode, False, True, **parameters
+                    grid_info, model, mode, parameters, False, True
                 )
 
         if mode == 'fourier':
@@ -1547,7 +1664,8 @@ class SceneModel(object):
                 "found!"
             )
 
-        psf_grid_info, psf = self.generate_psf(grid_size, subsampling)
+        psf_grid_info, psf = self.generate_psf(grid_size, subsampling,
+                                               **parameters)
         scale_psf = psf / np.max(psf)
 
         # Count how many pixels are above the half-maximum.
@@ -1568,6 +1686,113 @@ class SceneModel(object):
         num_parameters = len(fit_parameters)
 
         return num_data - num_parameters
+
+    def extract(self, images, variances=None, **parameters):
+        """Extract the coefficent parameters from a set of images.
+
+        Coefficients refer to any parameters in the model that scale a
+        component, including amplitudes, backgrounds, etc.
+
+        If any parameters are modified between images, they can be passed as an
+        array with the same length as the number of parameters (eg: wavelength
+        dependence).
+
+        images be either a single image or a list of images. Specifying the
+        variance with variances is optional (a least-squares extraction will be
+        done), but if done it must have the same shape as images.
+        """
+        # Handle the case where we want to extract a single image. After this,
+        # images and variances will always be a list of images and variances.
+        if len(np.shape(images)) == 2:
+            # Single image was passed
+            images = np.asarray(images)[np.newaxis, :, :]
+            if variances is not None:
+                variances = np.asarray(variances)[np.newaxis, :, :]
+        else:
+            images = np.asarray(images)
+            if variances is not None:
+                variances = np.asarray(variances)
+
+        extraction_results = []
+
+        for idx in range(len(images)):
+            # Update the model with any parameters that were passed in.
+            image_parameters = {}
+            for parameter_name, parameter_value in parameters.items():
+                parameter_dimension = len(np.shape(parameter_value))
+                if parameter_dimension == 1:
+                    # An array, one for each image
+                    use_parameter = parameter_value[idx]
+                elif parameter_dimension == 0:
+                    # A single value, same for each image
+                    use_parameter = parameter_value
+                else:
+                    # Shouldn't get here...
+                    raise PsfModelException(
+                        "Can't parse parameter %s! Too many dimensions" %
+                        parameter_name
+                    )
+                image_parameters[parameter_name] = use_parameter
+
+            # Process the image, and flag any bad pixels or things like that
+            if variances is not None:
+                variance = variances[idx]
+            else:
+                variance = None
+            image_fit_data = self._process_image(images[idx], variance)
+
+            # Calculate the components of the scene
+            components, eval_parameters = self.evaluate(
+                separate_components=True,
+                apply_coefficients=False,
+                return_full_parameters=True,
+                **image_parameters
+            )
+
+            # Evaluate the coefficients analytically
+            coef_names, coef_values, coef_variances = \
+                self._calculate_coefficients(
+                    components,
+                    image_fit_data['mask_data'],
+                    image_fit_data['mask_variance'],
+                    image_fit_data['mask'],
+                    **eval_parameters
+                )
+
+            result = {}
+            for name, value, variance in zip(coef_names, coef_values,
+                                             coef_variances):
+                result[name] = value
+                result["%s_variance" % name] = variance
+
+            extraction_results.append(result)
+
+        extraction_results = Table(extraction_results)
+
+        return extraction_results
+
+    def get_fits_header_items(self, prefix=None):
+        """Get a list of parameters to put into the fits header.
+
+        Each entry has the form (fits_keyword, value, description).
+        """
+        fits_list = []
+        for parameter_name, parameter_dict in self._parameter_info.items():
+            # Only include parameters whose value is set.
+            if parameter_dict['value'] is None:
+                # Don't add in parameters whose values aren't set (eg: derived
+                # parameters when we make a PSF out of a MultipleImageFitter
+                # object. We don't want to include the parameters for a single
+                # image, we want the global parameters).
+                continue
+
+            keyword = parameter_dict['fits_keyword']
+            value = parameter_dict['value']
+            description = parameter_dict['fits_description']
+
+            fits_list.append((keyword, value, description))
+
+        return fits_list
 
     def plot(self):
         """Plot the data and model with various diagnostic plots."""
@@ -1725,11 +1950,10 @@ class ModelElement(object):
         self.prefix = prefix
 
         # Set up the cache
-        self._cache_hits = 0
-        self._cache_misses = 0
-        self.clear_cache()
+        self._cache = DumbLRUCache(max_size=5)
 
         self._parameter_info = OrderedDict()
+        self._model_name_map = dict()
         self._setup_parameters()
 
     def _add_parameter(self, name, value, bounds, fits_keyword=None,
@@ -1742,15 +1966,17 @@ class ModelElement(object):
             'fixed': fixed,
             'coefficient': coefficient,
             'derived': derived,
-            'apply_prefix': apply_prefix,
             'fits_keyword': fits_keyword,
             'fits_description': fits_description,
         }
 
         if apply_prefix and self.prefix is not None:
-            name = '%s_%s' % (self.prefix, name)
+            model_name = '%s_%s' % (self.prefix, name)
+        else:
+            model_name = name
 
-        self._parameter_info[name] = new_parameter
+        self._parameter_info[model_name] = new_parameter
+        self._model_name_map[name] = model_name
 
     def _setup_parameters(self):
         """Initialize the parameters for a given image.
@@ -1760,32 +1986,43 @@ class ModelElement(object):
         """
         pass
 
-    def _apply_prefix(self, name):
-        """Apply a prefix if needed to a parameter name"""
-        if self.prefix is None:
-            # Nothing to do.
-            return name
+    def _modify_parameter(self, name, model_name=False, **kwargs):
+        """Modify a parameter.
 
-        if (name in self._parameter_info and
-                self._parameter_info[name]['apply_prefix'] is False):
-            # Shouldn't add a prefix to this parameter
-            return name
-
-        name = '%s_%s' % (self.prefix, name)
-
-        return name
-
-    def _modify_parameter(self, name, apply_prefix=True, **kwargs):
-        """Modify a parameter"""
+        If internal_name is True, then the name passed in is the internal name
+        of the parameter (eg: amplitude). Otherwise, the name passed in is the
+        model name of the parameter (eg: star4_amplitude).
+        """
         if 'derived' in kwargs and kwargs['derived'] is True:
             # When we change a parameter to derived, unset its value since it
             # is no longer applicable.
             kwargs['value'] = None
 
-        if apply_prefix:
-            name = self._apply_prefix(name)
+        if not model_name:
+            # Get the model name
+            name = self._model_name_map[name]
 
         self._parameter_info[name].update(kwargs)
+
+    def rename_parameter(self, original_name, new_name):
+        """Rename a parameter"""
+        if original_name not in self._parameter_info:
+            raise PsfModelException("%s has no parameter named %s." %
+                                    (type(self), original_name))
+
+        if new_name in self._parameter_info:
+            raise PsfModelException("%s already has a parameter named %s." %
+                                    (type(self), new_name))
+
+        # Keep the order of _parameter_info. We need to recreate the
+        # OrderedDict to do this.
+        self._parameter_info = OrderedDict(
+            (new_name if key == original_name else key, value) for key, value
+            in self._parameter_info.items()
+        )
+
+        # Update the model name map dictionary.
+        self._model_name_map[original_name] = new_name
 
     def fix(self, **kwargs):
         """Fix a set of parameters to a given set of values.
@@ -1820,7 +2057,7 @@ class ModelElement(object):
     @property
     def parameters(self):
         """Return a list of the current parameter values."""
-        full_parameters = OrderedDict()
+        full_parameters = dict()
         for parameter_name, parameter_dict in self._parameter_info.items():
             full_parameters[parameter_name] = parameter_dict['value']
 
@@ -1831,7 +2068,7 @@ class ModelElement(object):
         """Return an ordered dictionary of the parameters that are the
         coefficients for each component of the model.
         """
-        coefficients = OrderedDict()
+        coefficients = dict()
         for parameter_name, parameter_dict in self._parameter_info.items():
             if not parameter_dict['coefficient']:
                 continue
@@ -1905,8 +2142,8 @@ class ModelElement(object):
         """Set the value of a given parameter"""
         self.set_parameters(**{parameter: value})
 
-    def _update_model(self, grid_info, model, mode, separate_components,
-                      apply_coefficients, **parameters):
+    def _update_model(self, grid_info, model, mode, parameters,
+                      separate_components, apply_coefficients):
         """Apply the model element to a model.
 
         The behavior here needs to be implemented in subclasses. model is the
@@ -1922,8 +2159,8 @@ class ModelElement(object):
         (this is used for fitting).
 
         The exact behavior here will vary. Some examples are:
-        - ModelComponent: adds new components in to the model (eg: a point
-          source, a galaxy)
+        - SubsampledModelComponent: adds new components in to the model (eg: a
+          point source, a galaxy)
         - ConvolutionElement: convolves the model with something (eg: a PSF).
         - Pixelizer: pixelizes the model and removes subsampling to obtain real
           pixels.
@@ -1933,28 +2170,32 @@ class ModelElement(object):
         updated parameters that includes derived parameters and internal ones.
         """
         # Add in base parameters
-        base_parameters = dict(self.parameters, **parameters)
+        for key, parameter_dict in self._parameter_info.items():
+            if key not in parameters:
+                parameters[key] = parameter_dict['value']
 
         # Update the derived parameters.
-        full_parameters = self._calculate_derived_parameters(base_parameters)
+        full_parameters = self._calculate_derived_parameters(parameters)
 
         return model, mode, full_parameters
 
-    def _extract_parameter(self, parameter_dict, name, apply_prefix=True):
+    def _extract_parameter(self, parameter_dict, name, model_name=False):
         """Retrieve a parameter from a dictionary of parameters.
 
         If the parameter isn't in the dictionary, then it is pulled from the
         internal set of parameters.
 
-        If the ModelElement class was initialized with a prefix, this method
-        adds the prefix in to make the prefix transparent to the calling
-        function. To avoid this, pass apply_prefix=False.
+        If model_name is True, then the name passed in is the name used in the
+        model (eg: star4_amplitude). Otherwise, it is the internal name to this
+        class (eg: amplitude). We transform this appropriately.
         """
-        if apply_prefix:
-            name = self._apply_prefix(name)
+        if not model_name:
+            # Get the model name
+            name = self._model_name_map[name]
 
         if name not in self._parameter_info:
-            raise PsfModelException("Unknown parameter %s for %s!" % (self))
+            raise PsfModelException("Unknown parameter %s for %s!" %
+                                    (name, self))
 
         if name in parameter_dict:
             return parameter_dict[name]
@@ -1973,17 +2214,17 @@ class ModelElement(object):
 
         return result
 
-    def _update_parameter_dict(self, parameter_dict, apply_prefix=True,
+    def _update_parameter_dict(self, parameter_dict, model_name=False,
                                **kwargs):
         """Update a dictionary of parameters with new values.
 
-        If the ModelElement class was initialized with a prefix, this method
-        adds the prefix in to make the prefix transparent to the calling
-        function. To avoid this, pass apply_prefix=False.
+        If model_name is True, then the name passed in is the name used in the
+        model (eg: star4_amplitude). Otherwise, it is the internal name to this
+        class (eg: amplitude). We transform this appropriately.
         """
         for name, value in kwargs.items():
-            if apply_prefix:
-                name = self._apply_prefix(name)
+            if not model_name:
+                name = self._model_name_map[name]
 
             parameter_dict[name] = value
 
@@ -2030,24 +2271,14 @@ class ModelElement(object):
                 if isinstance(value, np.numpy_boxes.ArrayBox):
                     return calculator()
 
-        for key, value in kwargs.items():
-            if key not in cache or cache[key] != value:
-                break
-        else:
-            # All keys are the same as in the cache, if the item is in the
-            # cache, it is the right one.
-            if item in cache:
-                self._cache_hits += 1
-                return cache[item]
+        # Try to get the item from the cache.
+        cache_value = cache[kwargs]
+        if cache_value is not None:
+            return cache_value
 
-        # Something isn't right. We need to recalculate the item in the
-        # cache.
-        self._cache_misses += 1
+        # Not in the cache. We need to recalculate the item.
         new_value = calculator()
-        cache[item] = new_value
-
-        for key, value in kwargs.items():
-            cache[key] = value
+        cache[kwargs] = new_value
 
         return new_value
 
@@ -2070,16 +2301,16 @@ class ModelElement(object):
     def clear_cache(self):
         """Clear the internal caches."""
         # Cache for specific parts of the PSF calculation.
-        self._cache = dict()
+        self._cache.clear()
 
     def print_cache_info(self):
         """Print info about the cache"""
-        print("Hits: %d" % self._cache_hits)
-        print("Misses: %d" % self._cache_misses)
+        print("Hits: %d" % self._cache.hits)
+        print("Misses: %d" % self._cache.misses)
 
 
 class MultipleImageFitter():
-    def __init__(self, scene_model, images, variances=None):
+    def __init__(self, scene_model, images, variances=None, **kwargs):
         """Initialze a fitter for multiple images.
 
         The fitter will fit a scene model to every image. scene_model is either
@@ -2103,7 +2334,7 @@ class MultipleImageFitter():
             else:
                 new_scene_model = deepcopy(scene_model)
 
-            new_scene_model.load_image(image, variance)
+            new_scene_model.load_image(image, variance, **kwargs)
 
             scene_models.append(new_scene_model)
 
@@ -2114,6 +2345,7 @@ class MultipleImageFitter():
         self._global_fixed_parameters = OrderedDict()
 
         self.fit_result = None
+        self.fit_initial_values = None
 
     def fix(self, **kwargs):
         """Fix a parameter to a specific value for all the models.
@@ -2460,6 +2692,7 @@ class MultipleImageFitter():
             print("-"*70)
             print("%20s: %g/%g" % ('chi2/dof', self.fit_result.fun,
                                    self.degrees_of_freedom))
+            print("%20s: %d" % ('nfev', self.fit_result.nfev))
 
         print("="*70)
 
@@ -2628,7 +2861,7 @@ class SubsampledModelElement(ModelElement):
     model can be freely transformed between the two to make calculations
     easier.
     """
-    def _evaluate(self, x, y, subsampling, grid_info, **parameters):
+    def _evaluate(self, x, y, subsampling, grid_info, parameters):
         """Evaluate the element at a set of x and y positions with the given
         parameters.
 
@@ -2644,16 +2877,15 @@ class SubsampledModelElement(ModelElement):
         be used to capture extra ones.
 
         grid_info contains all of the grid information. Most of the time this
-        isn't necessary and it can just be ignored, or left to go into
-        **parameters. However, it is needed to do Fourier to real conversions
-        and things like that. The x, y and subsampling values are actually
-        included in grid_info as pad_grid_x and pad_grid_y, but they are
-        passed as separate parameters for convenience so that they don't have
-        to be explicitly pulled out every time.
+        isn't necessary and it can just be ignored. However, it is needed to do
+        Fourier to real conversions and things like that. The x, y and
+        subsampling values are actually included in grid_info as pad_grid_x and
+        pad_grid_y, but they are passed as separate parameters for convenience
+        so that they don't have to be explicitly pulled out every time.
         """
         # If _evaluate hasn't been defined, transform the Fourier space
         # evaluation of this element if it exists.
-        if self._has_fourier_evaluate():
+        if not self._has_fourier_evaluate():
             # Neither _evaluate nor _evaluate_fourier was defined, so there is
             # no way to evaluate the element!
             raise PsfModelException(
@@ -2664,14 +2896,15 @@ class SubsampledModelElement(ModelElement):
             grid_info['pad_grid_wx'],
             grid_info['pad_grid_wy'],
             subsampling,
-            **parameters
+            grid_info,
+            parameters
         )
 
         real_element = _fourier_to_real(fourier_element, grid_info)
 
         return real_element
 
-    def _evaluate_fourier(self, wx, wy, subsampling, grid_info, **parameters):
+    def _evaluate_fourier(self, wx, wy, subsampling, grid_info, parameters):
         """Evaluate the element in Fourier space at a set of wx and wy
         frequencies with the given parameters.
 
@@ -2679,7 +2912,7 @@ class SubsampledModelElement(ModelElement):
         """
         # If _evaluate_fourier hasn't been defined, transform the real space
         # evaluation of this element if it exists.
-        if self._has_real_evaluate():
+        if not self._has_real_evaluate():
             # Neither _evaluate nor _evaluate_fourier was defined, so there is
             # no way to evaluate the element!
             raise PsfModelException(
@@ -2690,15 +2923,16 @@ class SubsampledModelElement(ModelElement):
             grid_info['pad_grid_x'],
             grid_info['pad_grid_y'],
             subsampling,
-            **parameters
+            grid_info,
+            parameters
         )
 
         fourier_element = _real_to_fourier(real_element, grid_info)
 
         return fourier_element
 
-    def _cache_evaluate(self, x, y, subsampling, grid_info, mode='real',
-                        **parameters):
+    def _cache_evaluate(self, x, y, subsampling, grid_info, parameters,
+                        mode='real'):
         """Cache evaluations of this element.
 
         Assuming that no parameters have changed, we should be able to reuse
@@ -2712,7 +2946,7 @@ class SubsampledModelElement(ModelElement):
         """
         parameter_names = self._parameter_info.keys()
         values = self._extract_parameters(parameters, *parameter_names,
-                                          apply_prefix=False)
+                                          model_name=True)
         cache_parameters = dict(zip(parameter_names, values))
 
         if mode == 'fourier':
@@ -2730,47 +2964,48 @@ class SubsampledModelElement(ModelElement):
 
         result = self.get_cache(
             label,
-            calculator=lambda: func(x, y, subsampling, grid_info=grid_info,
-                                    **parameters),
+            calculator=lambda: func(x, y, subsampling, grid_info, parameters),
             **cache_parameters
         )
 
         return result
 
     def _cache_evaluate_fourier(self, wx, wy, subsampling, grid_info,
-                                **parameters):
+                                parameters):
         """Cache Fourier evaluations of this element.
 
         This is just a wrapper around _cache_evaluate with mode set to fourier.
         See it for details.
         """
-        return self._cache_evaluate(wx, wy, subsampling, grid_info,
-                                    mode='fourier', **parameters)
+        return self._cache_evaluate(wx, wy, subsampling, grid_info, parameters,
+                                    mode='fourier')
 
     def _has_real_evaluate(self):
         """Check if the real evaluation is defined"""
-        return self._evaluate is SubsampledModelElement._evaluate
+        return self._evaluate.__func__ is not \
+            SubsampledModelElement._evaluate.__func__
 
     def _has_fourier_evaluate(self):
         """Check if the real evaluation is defined"""
-        return self._evaluate_fourier is \
-            SubsampledModelElement._evaluate_fourier
+        return self._evaluate_fourier.__func__ is not \
+            SubsampledModelElement._evaluate_fourier.__func__
 
 
-class ModelComponent(SubsampledModelElement):
+class SubsampledModelComponent(SubsampledModelElement):
     """A model element representing one or multiple components that are added
     into the model.
 
     Examples of components are point sources, galaxies, backgrounds, etc.
     """
-    def _update_model(self, grid_info, model, mode, separate_components,
-                      apply_coefficients, **parameters):
+    def _update_model(self, grid_info, model, mode, parameters,
+                      separate_components, apply_coefficients):
         """Add the components defined by this class to a model."""
         # Apply any parent class updates
-        model, mode, parameters = super(ModelComponent, self)._update_model(
-            grid_info, model, mode, separate_components, apply_coefficients,
-            **parameters
-        )
+        model, mode, parameters = super(SubsampledModelComponent, self).\
+            _update_model(
+                grid_info, model, mode, parameters, separate_components,
+                apply_coefficients
+            )
 
         # Figure out whether to add the component in real or Fourier space. We
         # just go with whatever mode the model is currently in.
@@ -2796,20 +3031,20 @@ class ModelComponent(SubsampledModelElement):
                 grid_info['pad_grid_x'],
                 grid_info['pad_grid_y'],
                 grid_info['subsampling'],
-                grid_info=grid_info,
-                **parameters
+                grid_info,
+                parameters
             )
         elif mode == 'fourier':
             components = self._cache_evaluate_fourier(
                 grid_info['pad_grid_wx'],
                 grid_info['pad_grid_wy'],
                 grid_info['subsampling'],
-                grid_info=grid_info,
-                **parameters
+                grid_info,
+                parameters
             )
         else:
-            raise PsfModelException("ModelComponents can't be added to models "
-                                    "in mode %s!" % mode)
+            raise PsfModelException("SubsampledModelComponents can't be added "
+                                    "to models in mode %s!" % mode)
 
         # Add the new components to the model
         if len(np.shape(components)) == 2:
@@ -2831,15 +3066,15 @@ class ConvolutionElement(SubsampledModelElement):
 
     Examples of convolutions are PSFs, ADR, etc.
     """
-    def _update_model(self, grid_info, model, mode, separate_components,
-                      apply_coefficients, **parameters):
+    def _update_model(self, grid_info, model, mode, parameters,
+                      separate_components, apply_coefficients):
         """Add the components defined by this class to a model."""
         # Apply any parent class updates
         model, mode, parameters = super(ConvolutionElement, self).\
             _update_model(
-            grid_info, model, mode, separate_components, apply_coefficients,
-            **parameters
-        )
+                grid_info, model, mode, parameters, separate_components,
+                apply_coefficients
+            )
 
         # Convolutions have to happen in Fourier space (where they are a
         # multiplication), so we convert the model to Fourier space if
@@ -2862,8 +3097,8 @@ class ConvolutionElement(SubsampledModelElement):
             grid_info['pad_grid_wx'],
             grid_info['pad_grid_wy'],
             grid_info['subsampling'],
-            grid_info=grid_info,
-            **parameters
+            grid_info,
+            parameters
         )
 
         # Convolve the model with the target. Note that we are operating in
@@ -2897,13 +3132,13 @@ class Pixelizer(ModelElement):
     pixelated. The model can no longer be transformed back to Fourier space,
     and any operations have to happen on the pixelated grid.
     """
-    def _update_model(self, grid_info, model, mode, separate_components,
-                      apply_coefficients, **parameters):
+    def _update_model(self, grid_info, model, mode, parameters,
+                      separate_components, apply_coefficients):
         """Pixelate the image"""
         # Apply any parent class updates
         model, mode, parameters = super(Pixelizer, self)._update_model(
-            grid_info, model, mode, separate_components, apply_coefficients,
-            **parameters
+            grid_info, model, mode, parameters, separate_components,
+            apply_coefficients
         )
 
         if mode == 'real':
@@ -2950,7 +3185,10 @@ class Pixelizer(ModelElement):
                     ]
 
             # Remove borders
-            trimmed_model = pixelated_model[border:-border, border:-border]
+            if border == 0:
+                trimmed_model = pixelated_model
+            else:
+                trimmed_model = pixelated_model[border:-border, border:-border]
             final_model.append(trimmed_model)
 
         if not separate_components:
@@ -2970,13 +3208,13 @@ class RealPixelizer(ModelElement):
     values of the subpixels. This should only be used if the subsampling scale
     is much smaller than the scale at which the model varies.
     """
-    def _update_model(self, grid_info, model, mode, separate_components,
-                      apply_coefficients, **parameters):
+    def _update_model(self, grid_info, model, mode, parameters,
+                      separate_components, apply_coefficients):
         """Pixelate the image"""
         # Apply any parent class updates
         model, mode, parameters = super(RealPixelizer, self)._update_model(
-            grid_info, model, mode, separate_components, apply_coefficients,
-            **parameters
+            grid_info, model, mode, parameters, separate_components,
+            apply_coefficients
         )
 
         if mode == 'fourier':
@@ -3004,7 +3242,10 @@ class RealPixelizer(ModelElement):
                                                        j::subsampling]
 
             # Remove borders
-            trimmed_model = pixelated_model[border:-border, border:-border]
+            if border == 0:
+                trimmed_model = pixelated_model
+            else:
+                trimmed_model = pixelated_model[border:-border, border:-border]
             final_model.append(trimmed_model)
 
         if not separate_components:
@@ -3013,7 +3254,97 @@ class RealPixelizer(ModelElement):
         return final_model, 'pixel', parameters
 
 
-class PointSource(ModelComponent):
+class PixelModelComponent(ModelElement):
+    """A model element representing one or multiple components that are added
+    into the model after pixelization.
+
+    This is primarily intended to be used for backgrounds or detector
+    artifacts.
+    """
+    def _update_model(self, grid_info, model, mode, parameters,
+                      separate_components, apply_coefficients):
+        """Add the components defined by this class to a model."""
+        # Apply any parent class updates
+        model, mode, parameters = super(PixelModelComponent, self).\
+            _update_model(
+                grid_info, model, mode, parameters, separate_components,
+                apply_coefficients
+            )
+
+        if mode != 'pixel':
+            raise PsfModelException(
+                "PixelModelComponents can only be added to a SceneModel after "
+                "pixelization. (current mode %s)" % mode
+            )
+
+        if not apply_coefficients:
+            # Don't apply coefficients to the model. This means that the scales
+            # of the components should be set to 1.
+            unscale_parameters = {}
+            for parameter_name, parameter_dict in self._parameter_info.items():
+                if parameter_dict['coefficient']:
+                    unscale_parameters[parameter_name] = 1.
+            parameters = dict(parameters, **unscale_parameters)
+
+        components = self._cache_evaluate(
+            grid_info['grid_x'],
+            grid_info['grid_y'],
+            grid_info,
+            parameters
+        )
+
+        # Add the new components to the model
+        if len(np.shape(components)) == 2:
+            # Single component. Put it into a list so that we can handle
+            # everything in the same way.
+            components = [components]
+
+        if separate_components:
+            model.extend(components)
+        else:
+            for component in components:
+                model += component
+
+        return model, mode, parameters
+
+    def _cache_evaluate(self, x, y, grid_info, parameters):
+        """Cache evaluations of this element.
+
+        Assuming that no parameters have changed, we should be able to reuse
+        the last evaluation of this element. Because different parts of the
+        model are typically being varied independently when doing things like
+        fitting, there is a lot of reuse of model elements, so this gives a
+        large speedup.
+
+        This function can be used in place of _evaluate to directly gain
+        caching functionality.
+        """
+        parameter_names = self._parameter_info.keys()
+        values = self._extract_parameters(parameters, *parameter_names,
+                                          model_name=True)
+        cache_parameters = dict(zip(parameter_names, values))
+
+        # Add in information about the grid that uniquely defines it.
+        cache_parameters.update(self._grid_cache_parameters(grid_info))
+
+        result = self.get_cache(
+            'evaluate',
+            calculator=lambda: self._evaluate(x, y, grid_info, parameters),
+            **cache_parameters
+        )
+
+        return result
+
+    def _evaluate(self, x, y, grid_info, parameters):
+        """Evaluate the element at a set of x and y positions with the given
+        parameters.
+
+        This must be implemented in subclasses.
+        """
+        return None
+
+
+class PointSource(SubsampledModelComponent):
     def _setup_parameters(self):
         self._add_parameter('amplitude', None, (None, None), 'AMP',
                             'Point source amplitude', coefficient=True)
@@ -3022,10 +3353,10 @@ class PointSource(ModelComponent):
         self._add_parameter('center_y', None, (None, None), 'POSY',
                             'Point source center position Y')
 
-    def _evaluate_fourier(self, wx, wy, subsampling, **parameters):
-        center_x = self._extract_parameter(parameters, 'center_x')
-        center_y = self._extract_parameter(parameters, 'center_y')
-        amplitude = self._extract_parameter(parameters, 'amplitude')
+    def _evaluate_fourier(self, wx, wy, subsampling, grid_info, parameters):
+        center_x, center_y, amplitude = self._extract_parameters(
+            parameters, 'center_x', 'center_y', 'amplitude'
+        )
 
         # A delta function is a complex exponential in Fourier space.
         point_source_fourier = amplitude * np.exp(
@@ -3035,15 +3366,59 @@ class PointSource(ModelComponent):
         return point_source_fourier
 
 
-class Background(ModelComponent):
+class GaussianPointSource(SubsampledModelComponent):
+    """A point source convolved with a Gaussian.
+
+    This can be evaluated entirely in real space, so it is useful to use this
+    for simple Gaussian fits over a model where a point source is explicitly
+    convolved with a Gaussian PSF.
+    """
+    def _setup_parameters(self):
+        super(GaussianPointSource, self)._setup_parameters()
+
+        self._add_parameter('amplitude', None, (None, None), 'AMP',
+                            'Point source amplitude', coefficient=True)
+        self._add_parameter('center_x', None, (None, None), 'POSX',
+                            'Point source center position X')
+        self._add_parameter('center_y', None, (None, None), 'POSY',
+                            'Point source center position Y')
+        self._add_parameter('sigma_x', 1., (0.1, 20.), 'SIGX',
+                            'Gaussian width in X direction')
+        self._add_parameter('sigma_y', 1., (0.1, 20.), 'SIGY',
+                            'Gaussian width in Y direction')
+        self._add_parameter('rho', 0., (-1., 1.), 'RHO',
+                            'Gaussian correlation')
+
+    def _evaluate(self, x, y, subsampling, grid_info, parameters):
+        amplitude, center_x, center_y, sigma_x, sigma_y, rho = \
+            self._extract_parameters(
+                parameters, 'amplitude', 'center_x', 'center_y', 'sigma_x',
+                'sigma_y', 'rho'
+            )
+
+        gaussian = np.exp(-0.5 / (1 - rho**2) * (
+            (x - center_x)**2 / sigma_x**2 +
+            (y - center_y)**2 / sigma_y**2 +
+            -2. * x * y * rho / sigma_x / sigma_y
+        ))
+
+        # Normalize
+        gaussian /= 2 * np.pi * sigma_x * sigma_y * np.sqrt(1 - rho**2)
+        gaussian /= subsampling**2
+        gaussian *= amplitude
+
+        return gaussian
+
+
+class Background(PixelModelComponent):
     def _setup_parameters(self):
         self._add_parameter('background', None, (None, None), 'BKG',
                             'Background in cube', coefficient=True)
 
-    def _evaluate(self, x, y, subsampling, **parameters):
+    def _evaluate(self, x, y, grid_info, parameters):
         background = self._extract_parameter(parameters, 'background')
 
-        return np.ones(x.shape) * background / subsampling**2
+        return np.ones(x.shape) * background
 
 
 class GaussianPsfElement(PsfElement):
@@ -3057,7 +3432,7 @@ class GaussianPsfElement(PsfElement):
         self._add_parameter('rho', 0., (-1., 1.), 'RHO',
                             'Gaussian correlation')
 
-    def _evaluate(self, x, y, subsampling, **parameters):
+    def _evaluate(self, x, y, subsampling, grid_info, parameters):
         sigma_x, sigma_y, rho = self._extract_parameters(
             parameters, 'sigma_x', 'sigma_y', 'rho'
         )
@@ -3074,7 +3449,7 @@ class GaussianPsfElement(PsfElement):
 
         return gaussian
 
-    def _evaluate_fourier(self, wx, wy, subsampling, **parameters):
+    def _evaluate_fourier(self, wx, wy, subsampling, grid_info, parameters):
         sigma_x, sigma_y, rho = self._extract_parameters(
             parameters, 'sigma_x', 'sigma_y', 'rho'
         )
@@ -3099,7 +3474,7 @@ class GaussianMoffatPsfElement(PsfElement):
         self._add_parameter('ell', 1., (0.2, 5.), 'E0', 'Ellipticity')
         self._add_parameter('xy', 0., (-0.6, 0.6), 'XY', 'XY coefficient')
 
-    def _evaluate(self, x, y, subsampling, **parameters):
+    def _evaluate(self, x, y, subsampling, grid_info, parameters):
         alpha, sigma, beta, eta, ell, xy = self._extract_parameters(
             parameters, 'alpha', 'sigma', 'beta', 'eta', 'ell', 'xy'
         )
@@ -3134,7 +3509,7 @@ class ExponentialPowerPsfElement(PsfElement):
         self._add_parameter('power', 1.6, (0., 2.), 'POW', 'power')
         self._add_parameter('width', 0.5, (0.01, 30.), 'WID', 'width')
 
-    def _evaluate_fourier(self, wx, wy, subsampling, **parameters):
+    def _evaluate_fourier(self, wx, wy, subsampling, grid_info, parameters):
         power, width = self._extract_parameters(parameters, 'power', 'width')
 
         wr = np.sqrt(wx*wx + wy*wy)
@@ -3223,7 +3598,7 @@ class SnifsAdrElement(ConvolutionElement):
         self._add_parameter('adr_theta', 0., (None, None), 'THETA',
                             'ADR theta parameter')
 
-    def _evaluate_fourier(self, wx, wy, subsampling, **parameters):
+    def _evaluate_fourier(self, wx, wy, subsampling, grid_info, parameters):
         wavelength, adr_delta, adr_theta = self._extract_parameters(
             parameters, 'wavelength', 'adr_delta', 'adr_theta'
         )
@@ -3268,6 +3643,124 @@ class SnifsAdrElement(ConvolutionElement):
         self.spaxel_size = spaxel_size
 
 
+class SnifsOldPsfElement(GaussianMoffatPsfElement):
+    """Model of the PSF as implemented in the pipeline.
+
+    Don't use this class directly, subclass it instead with the following
+    parameters set.
+    """
+    def __init__(self, exposure_time, *args, **kwargs):
+        """Initialize the PSF. The PSF parameters depend on the exposure time.
+        """
+        super(SnifsOldPsfElement, self).__init__(*args, **kwargs)
+
+        if exposure_time < 15:
+            # Short exposure PSF
+            self.beta0 = 1.395
+            self.beta1 = 0.415
+            self.sigma0 = 0.56
+            self.sigma1 = 0.2
+            self.eta0 = 0.6
+            self.eta1 = 0.16
+        elif exposure_time > 15:
+            # Long exposure PSF
+            self.beta0 = 1.685
+            self.beta1 = 0.345
+            self.sigma0 = 0.545
+            self.sigma1 = 0.215
+            self.eta0 = 1.04
+            self.eta1 = 0.00
+
+    def _setup_parameters(self):
+        super(SnifsOldPsfElement, self)._setup_parameters()
+        self._modify_parameter('sigma', derived=True)
+        self._modify_parameter('beta', derived=True)
+        self._modify_parameter('eta', derived=True)
+
+    def _calculate_derived_parameters(self, parameters):
+        """Fix sigma, beta and eta to all be functions of alpha"""
+        alpha = self._extract_parameter(parameters, 'alpha')
+
+        # Derive all of the Gaussian and Moffat parameters from alpha
+        beta = self.beta0 + self.beta1 * alpha
+        sigma = self.sigma0 + self.sigma1 * alpha
+        eta = self.eta0 + self.eta1 * alpha
+
+        # Add in the new parameters
+        parameters = self._update_parameter_dict(parameters, beta=beta,
+                                                 sigma=sigma, eta=eta)
+
+        # Update parameters from the superclass
+        parent_parameters = super(SnifsOldPsfElement, self).\
+            _calculate_derived_parameters(parameters)
+
+        return parent_parameters
+
+
+class ChromaticSnifsOldPsfElement(SnifsOldPsfElement):
+    """A chromatic SnifsOldPsfElement with seeing dependence on wavelength.
+
+    The PSF alpha parameter takes the following form:
+
+        x = wave / ref_wave
+        alpha = A[-1] * x**(A[-2] + A[-3]*(x-1) + A[-4]*(x-1)**2 + ...)
+
+    The number of terms in the polynomial power term is determined by
+    alpha_degree. The default of alpha_degree=2 gives:
+
+        alpha = A2 * x**(A1 + A0*(x-1))
+    """
+    def __init__(self, alpha_degree=2, *args, **kwargs):
+        """Initialize the PSF."""
+        self.alpha_degree = alpha_degree
+
+        super(ChromaticSnifsOldPsfElement, self).__init__(*args, **kwargs)
+
+    def _setup_parameters(self):
+        super(ChromaticSnifsOldPsfElement, self)._setup_parameters()
+
+        # Alpha is now a derived parameter
+        self._modify_parameter('alpha', derived=True)
+
+        self._add_parameter('wavelength', None, (None, None), 'WAVE',
+                            'wavelength [A]', fixed=True, apply_prefix=False)
+
+        # Powerlaw polynomial parameters
+        for i in range(self.alpha_degree):
+            self._add_parameter('A%d' % i, 0., (None, None), 'A%d' % i,
+                                'Alpha coeff. a%d' % i)
+
+        # Reference width parameter
+        deg = self.alpha_degree
+        self._add_parameter('A%d' % deg, 2.4, (0.01, 30.), 'A%d' % deg,
+                            'Alpha coeff. a%d' % deg)
+
+    def _calculate_derived_parameters(self, parameters):
+        """Calculate the seeing width parameter using a power-law in wavelength
+        """
+        wavelength = self._extract_parameter(parameters, 'wavelength')
+        alpha_params = self._extract_parameters(
+            parameters, *['A%d' % i for i in range(self.alpha_degree + 1)]
+        )
+
+        # Ensure that all required variables have been set properly.
+        if wavelength is None:
+            raise PsfModelException("Must set wavelength!")
+
+        # Calculate the alpha parameters as a function of wavelength.
+        x = wavelength / reference_wavelength
+        alpha = alpha_params[-1] * x**(np.polyval(alpha_params[:-1], x-1))
+
+        # Add in the new parameters
+        parameters = self._update_parameter_dict(parameters, alpha=alpha)
+
+        # Update parameters from the superclass
+        parent_parameters = super(ChromaticSnifsOldPsfElement, self).\
+            _calculate_derived_parameters(parameters)
+
+        return parent_parameters
+
+
 class TrackingEllipticityPsfElement(PsfElement):
     """A PsfElement that represents non-chromatic ellipticity due to effects
     like tracking or wind-shake
@@ -3282,8 +3775,7 @@ class TrackingEllipticityPsfElement(PsfElement):
     then defined by two points in Cartesian space that specify the width and
     angle. Angles are difficult for fitters as they lead to singularities when
     the width is near zero, so we fit the ellipticity with the two points in
-    Cartesian space directly, and we expose the resulting angle and width as
-    derived parameters.
+    Cartesian space directly.
 
     Note that this definition means that flipping the signs of both the X and Y
     coordinates leads to the same model, so there is a degeneracy. The
@@ -3299,25 +3791,8 @@ class TrackingEllipticityPsfElement(PsfElement):
                             'Ellipticity coordinate in X direction')
         self._add_parameter('ell_coord_y', 0.1, (-30., 30.), 'ELLY',
                             'Ellipticity coordinate in Y direction')
-        self._add_parameter('ell_angle', None, (None, None), 'ELLA',
-                            'Ellipticity angle (deg)', derived=True)
-        self._add_parameter('ell_width', None, (None, None), 'ELLW',
-                            'Ellipticity width', derived=True)
 
-    def _calculate_derived_parameters(self, parameters):
-        p = parameters.copy()
-
-        p['ell_angle'] = (np.arctan2(p['ell_coord_y'], p['ell_coord_x']) *
-                          180. / np.pi)
-        p['ell_width'] = np.sqrt(p['ell_coord_x']**2 + p['ell_coord_y']**2)
-
-        # Update parameters from the superclass
-        parent_parameters = super(TrackingEllipticityPsfElement, self).\
-            _calculate_derived_parameters(p)
-
-        return parent_parameters
-
-    def _evaluate_fourier(self, wx, wy, subsampling, **parameters):
+    def _evaluate_fourier(self, wx, wy, subsampling, grid_info, parameters):
         ell_coord_x, ell_coord_y = self._extract_parameters(
             parameters, 'ell_coord_x', 'ell_coord_y',
         )
@@ -3332,6 +3807,18 @@ class TrackingEllipticityPsfElement(PsfElement):
         ))
 
         return gaussian
+
+
+class GaussianSceneModel(SceneModel):
+    """A scene model of a point source convovled with a Gaussian."""
+    def __init__(self, *args, **kwargs):
+        elements = [
+            GaussianPointSource,
+            RealPixelizer,
+            Background
+        ]
+
+        super(GaussianSceneModel, self).__init__(elements, *args, **kwargs)
 
 
 class SnifsFourierSceneModel(SceneModel):
@@ -3351,10 +3838,10 @@ class SnifsFourierSceneModel(SceneModel):
     a function of wavelength and a power law is used to determine the seeing
     variation with wavelength.
     """
-    def __init__(self, image=None, variance=None, grid_size=None,
-                 subsampling=3, border=15, use_empirical_parameters=True,
-                 wavelength_dependence=True, adr_model=None, spaxel_size=None,
-                 pressure=None, temperature=None, **kwargs):
+    def __init__(self, image=None, variance=None,
+                 use_empirical_parameters=True, wavelength_dependence=False,
+                 adr_model=None, spaxel_size=None, pressure=None,
+                 temperature=None, **kwargs):
         """Build the elements of the PSF model.
 
         If use_empirical_parameters is True, then the instrumental parameters
@@ -3362,10 +3849,11 @@ class SnifsFourierSceneModel(SceneModel):
         determined from the whole SNfactory standard star dataset.
         """
 
-        elements = [
-            PointSource,
-            Background
-        ]
+        elements = []
+
+        # Point source for the supernova
+        point_source_element = PointSource()
+        elements.append(point_source_element)
 
         # Gaussian instrumental core
         inst_core_element = GaussianPsfElement(prefix='inst_core')
@@ -3383,6 +3871,11 @@ class SnifsFourierSceneModel(SceneModel):
             )
             elements.append(adr_element)
 
+            # Rename the center position parameters to specify that they are
+            # the positions at the reference wavelength.
+            point_source_element.rename_parameter('center_x', 'ref_center_x')
+            point_source_element.rename_parameter('center_y', 'ref_center_y')
+
         # Seeing
         if wavelength_dependence:
             seeing_element = ChromaticExponentialPowerPsfElement(
@@ -3399,23 +3892,101 @@ class SnifsFourierSceneModel(SceneModel):
         # Pixelize
         elements.append(Pixelizer)
 
+        # Background. The background is a slowly varying function, and doesn't
+        # need to be convolved with the PSF or with the pixel. We apply it
+        # after pixelization.
+        background_element = Background()
+        elements.append(background_element)
+
+        if wavelength_dependence:
+            shared_parameters = ['wavelength']
+        else:
+            shared_parameters = []
+
         super(SnifsFourierSceneModel, self).__init__(
             elements=elements,
             image=image,
             variance=variance,
-            grid_size=grid_size,
-            subsampling=subsampling,
-            border=border,
-            shared_parameters=['wavelength'],
+            shared_parameters=shared_parameters,
             **kwargs
         )
 
         if use_empirical_parameters:
             self.fix(
-                inst_core_sigma_x=0.1680747,
-                inst_core_sigma_y=0.1090168,
+                inst_core_sigma_x=0.2376935 * np.sqrt(2),
+                inst_core_sigma_y=0.154173 * np.sqrt(2),
                 inst_core_rho=0.,
                 inst_wings_power=1.07,
                 inst_wings_width=0.209581,
                 seeing_power=1.52,
             )
+
+
+class SnifsOldSceneModel(SceneModel):
+    """A scene model for the SNIFS IFU using a Gaussian + Moffat PSF.
+
+    This implements the original PSF model for SNIFS which is the sum of a
+    Gaussian and a Moffat profile.
+
+    The model can optionally be specified with wavelength dependence, in which
+    case an ADR model is used to determine the position of the point source as
+    a function of wavelength and a power law is used to determine the seeing
+    variation with wavelength.
+    """
+    def __init__(self, image=None, variance=None, exposure_time=None,
+                 alpha_degree=2, wavelength_dependence=False, adr_model=None,
+                 spaxel_size=None, pressure=None, temperature=None, **kwargs):
+        """Build the elements of the PSF model."""
+        elements = []
+
+        if exposure_time is None:
+            raise PsfModelException(
+                "Must specify exposure time for SnifsOldSceneModel"
+            )
+
+        # Point source for the supernova
+        point_source_element = PointSource()
+        elements.append(point_source_element)
+
+        # Gaussian + Moffat PSF.
+        if wavelength_dependence:
+            psf_element = ChromaticSnifsOldPsfElement(alpha_degree,
+                                                      exposure_time)
+        else:
+            psf_element = SnifsOldPsfElement(exposure_time)
+        elements.append(psf_element)
+
+        # ADR
+        if wavelength_dependence:
+            adr_element = SnifsAdrElement(
+                adr_model=adr_model, spaxel_size=spaxel_size,
+                pressure=pressure, temperature=temperature
+            )
+            elements.append(adr_element)
+
+            # Rename the center position parameters to specify that they are
+            # the positions at the reference wavelength.
+            point_source_element.rename_parameter('center_x', 'ref_center_x')
+            point_source_element.rename_parameter('center_y', 'ref_center_y')
+
+        # Pixelize
+        elements.append(RealPixelizer)
+
+        # Background. The background is a slowly varying function, and doesn't
+        # need to be convolved with the PSF or with the pixel. We apply it
+        # after pixelization.
+        background_element = Background()
+        elements.append(background_element)
+
+        if wavelength_dependence:
+            shared_parameters = ['wavelength']
+        else:
+            shared_parameters = []
+
+        super(SnifsOldSceneModel, self).__init__(
+            elements=elements,
+            image=image,
+            variance=variance,
+            shared_parameters=shared_parameters,
+            **kwargs
+        )
