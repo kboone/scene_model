@@ -34,10 +34,17 @@ use_autograd = False
 # Use a constant reference wavelength for easy comparisons.
 reference_wavelength = 5000.
 
+# By default, the scene model is evaluated on a subsampled grid with a border.
+# The default parameters for this border and subsampling are set here, although
+# they can be overriden in the SceneModel constructor. It is important that the
+# grid contains the full PSF, since the PSf will be normalized to be 1 in the
+# evaluated region!
 default_subsampling = 3
 default_border = 15
 
-## Debug flags. Enable to get a lot of output
+###############################################################################
+# Debug flags. Enable to get a lot of output
+###############################################################################
 
 # Show all Fourier transformations.
 debug_fourier = False
@@ -3932,6 +3939,12 @@ class SnifsOldSceneModel(SceneModel):
     case an ADR model is used to determine the position of the point source as
     a function of wavelength and a power law is used to determine the seeing
     variation with wavelength.
+
+    Note that extract_star's implementation worked only in real space while
+    this implementation uses Fourier transforms. Technically, we should get a
+    better result if we use the Pixelizer that convolves with the pixel in
+    Fourier space, but we need to use RealPixelizer which simply sums up the
+    subpixel values directly if we want to match the behavior of extract_star.
     """
     def __init__(self, image=None, variance=None, exposure_time=None,
                  alpha_degree=2, wavelength_dependence=False, adr_model=None,
