@@ -188,9 +188,10 @@ def calculate_covariance_finite_difference(chisq_function, parameter_names,
                 # minimum. This indicates that something is wrong because the
                 # minimizer failed.
                 raise PsfModelException(
-                    "Found better minimum while varying %s to calculate "
-                    "covariance matrix! Fit failed!" %
-                    parameter_names[parameter_idx]
+                    "Second derivative is negative when varying %s to "
+                    "calculate covariance matrix! Something is very wrong! "
+                    "(step=%f, second derivative=%f)" %
+                    (parameter_names[parameter_idx], step, diff)
                 )
 
             if diff < 1e-6:
@@ -1044,20 +1045,9 @@ class SceneModel(object):
         # troublesome for numerical precision. Here, we estimate the brightness
         # which can be used as a scale parameter for other algorithms.
 
-        # First, we estimate the position of the object using a median filter.
-        # Then, we estimate the background by taking the median of the pixels
-        # farthest away from the object.
-        medfilt_image = medfilt2d(image, 3)
-        med_center_i, med_center_j = np.unravel_index(
-            np.nanargmax(medfilt_image, axis=None),
-            medfilt_image.shape
-        )
-        med_center_x = grid_x[med_center_i, med_center_j]
-        med_center_y = grid_y[med_center_i, med_center_j]
-
         # Estimate the background by taking the median of the pixels farthest
-        # from the guessed object location in the image.
-        r2 = (mask_x - med_center_x)**2 + (mask_y - med_center_y)**2
+        # from the center of the image.
+        r2 = mask_x**2 + mask_y**2
         background_mask = r2 > np.percentile(r2, 100*(1-background_fraction))
         source_mask = ~background_mask
 
@@ -1073,10 +1063,10 @@ class SceneModel(object):
 
         scale = max(amplitude_guess, min_amplitude_guess)
 
-        # Reestimate the center position using a weighted average of the flux
-        # in the region near the detected object.
+        # Reestimate the center position using a weighted average of the
+        # absolute flux in the region near the detected object.
         sub_data = mask_data - background_guess
-        weights = sub_data[source_mask]
+        weights = np.abs(sub_data[source_mask])
         center_x_guess = np.average(mask_x[source_mask], weights=weights)
         center_y_guess = np.average(mask_y[source_mask], weights=weights)
 
@@ -1894,6 +1884,44 @@ class SceneModel(object):
                           'Reference wavelength [A]'))
 
         return fits_list
+
+    def load_fits_header(self, header, prefix=default_fits_prefix,
+                         skip_parameters=[]):
+        """Load parameters from a fits header
+
+        The header keys are prefix + the parameter's fits keyword.
+        (extract_star prefixes everything with ES_).
+
+        Parameters in skip_parameters are skipped and ignored. derived and
+        coefficient parameters are loaded if they are in the header, but
+        nothing is done if they aren't there. If any other parameter is
+        missing, a warning is printed.
+        """
+        # Read in element parameters and set them.
+        element_parameters = {}
+        for name, parameter_dict in self._parameter_info.items():
+            if name in skip_parameters:
+                # Ignore this one
+                continue
+
+            fits_keyword = prefix + parameter_dict['fits_keyword']
+            try:
+                value = header[fits_keyword]
+            except KeyError:
+                if parameter_dict['derived'] or parameter_dict['coefficient']:
+                    # It is normal if derived or coefficient parameters aren't
+                    # in the header. For an extraction, the coefficients vary
+                    # for each wavelength, so there is no single appropriate
+                    # value.
+                    pass
+                else:
+                    print("WARNING: parameter %s not found in header! "
+                          "Skipping!" % fits_keyword)
+                continue
+
+            element_parameters[name] = value
+
+        self.set_parameters(update_derived=False, **element_parameters)
 
     def plot(self):
         """Plot the data and model with various diagnostic plots."""
@@ -3480,6 +3508,69 @@ class Background(PixelModelComponent):
         return np.ones(x.shape) * background
 
 
+class PolynomialBackground(PixelModelComponent):
+    def __init__(self, background_degree=0, normalization_scale=10., *args,
+                 **kwargs):
+        self.background_degree = background_degree
+        self.normalization_scale = normalization_scale
+        super(PolynomialBackground, self).__init__(*args, **kwargs)
+
+    def _setup_parameters(self):
+        """Setup the polynomial background parameters.
+
+        This is a 2-dimensional polynomial background. We label the flat
+        background level parameters as background, and the higher order terms
+        as background_x_y where x is the degree in the x-direction and y is the
+        degree in the y direction. eg: background_1_2 is degree 1 in x and
+        degree 2 in y.
+        """
+        self._add_parameter('background', None, (None, None), 'BKG',
+                            'Background', coefficient=True)
+
+        for x_degree in range(self.background_degree + 1):
+            for y_degree in range(self.background_degree + 1 - x_degree):
+                if x_degree == 0 and y_degree == 0:
+                    # Already added the constant background.
+                    continue
+
+                self._add_parameter(
+                    'background_%d_%d' % (x_degree, y_degree),
+                    0.,
+                    (None, None),
+                    'BKG%d%d' % (x_degree, y_degree),
+                    'Polynomial background, x-degree=%d, y-degree=%d' %
+                    (x_degree, y_degree),
+                    coefficient=True
+                )
+
+    def _evaluate(self, x, y, grid_info, background, **parameters):
+        components = []
+
+        # Zeroth order background
+        components.append(background * np.ones(x.shape))
+
+        # Normalize so that things vary on a reasonable scale
+        norm_x = x / self.normalization_scale
+        norm_y = y / self.normalization_scale
+
+        # Polynomial background components
+        for x_degree in range(self.background_degree + 1):
+            for y_degree in range(self.background_degree + 1 - x_degree):
+                if x_degree == 0 and y_degree == 0:
+                    # Already added the constant background.
+                    continue
+
+                name = 'background_%d_%d' % (x_degree, y_degree)
+                coefficient = parameters[name]
+                component = (
+                    coefficient * (norm_x**x_degree) * (norm_y**y_degree)
+                )
+
+                components.append(component)
+
+        return components
+
+
 class GaussianPsfElement(PsfElement):
     def _setup_parameters(self):
         self._add_parameter('sigma_x', 1., (0.1, 20.), 'SIGX',
@@ -4037,32 +4128,9 @@ class SnifsFourierSceneModel(SceneModel):
             scene_model = cls(use_empirical_parameters=False,
                               wavelength_dependence=False)
 
-        # Read in element parameters and set them.
-        skip_parameters = ['wavelength']
-        element_parameters = {}
-        for name, parameter_dict in scene_model._parameter_info.items():
-            if name in skip_parameters:
-                # Ignore this one
-                continue
-
-            fits_keyword = prefix + parameter_dict['fits_keyword']
-            try:
-                value = fits_header[fits_keyword]
-            except KeyError:
-                if parameter_dict['derived'] or parameter_dict['coefficient']:
-                    # It is normal if derived or coefficient parameters aren't
-                    # in the header. For an extraction, the coefficients vary
-                    # for each wavelength, so there is no single appropriate
-                    # value.
-                    pass
-                else:
-                    print("WARNING: parameter %s not found in header! "
-                          "Skipping!" % fits_keyword)
-                continue
-
-            element_parameters[name] = value
-
-        scene_model.set_parameters(update_derived=False, **element_parameters)
+        # Read in the rest of the parameters
+        scene_model.load_fits_header(fits_header, prefix=prefix,
+                                     skip_parameters=['wavelength'])
 
         return scene_model
 
