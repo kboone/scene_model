@@ -8,5 +8,5 @@ setup(
     description='Scene Modeling Package',
     author='Kyle Boone',
     author_email='kboone@berkeley.edu',
-    # packages=['.'],
+    packages=['scene_model'],
 )
