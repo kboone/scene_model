@@ -138,7 +138,7 @@ class ModelElement(object):
     def _modify_parameter(self, name, model_name=False, **kwargs):
         """Modify a parameter.
 
-        If internal_name is True, then the name passed in is the internal name
+        If model_name is False, then the name passed in is the internal name
         of the parameter (eg: amplitude). Otherwise, the name passed in is the
         model name of the parameter (eg: star4_amplitude).
         """
@@ -173,13 +173,21 @@ class ModelElement(object):
         # Update the model name map dictionary.
         self._model_name_map[original_name] = new_name
 
-    def fix(self, **kwargs):
+    def fix(self, model_name=False, **kwargs):
         """Fix a set of parameters to a given set of values.
 
         If the value that a parameter is set to is None, then the parameter is
         unfixed.
+
+        If model_name is False, then the name passed in is the internal name
+        of the parameter (eg: amplitude). Otherwise, the name passed in is the
+        model name of the parameter (eg: star4_amplitude).
         """
         for key, value in kwargs.items():
+            if not model_name:
+                # Get the model name
+                key = self._model_name_map[key]
+
             parameter_dict = self._parameter_info[key]
 
             if parameter_dict['derived']:

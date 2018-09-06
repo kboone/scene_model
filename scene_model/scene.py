@@ -533,7 +533,7 @@ class SceneModel(object):
     def fix(self, **kwargs):
         for key, value in kwargs.items():
             element = self.get_parameter_element(key)
-            element.fix(**{key: value})
+            element.fix(model_name=True, **{key: value})
 
     def _modify_parameter(self, name, **kwargs):
         element = self.get_parameter_element(name)

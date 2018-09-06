@@ -2,7 +2,7 @@
 from . import config
 from .utils import SceneModelException
 from .element import SubsampledModelComponent, PixelModelComponent, \
-    PsfElement, RealPixelizer
+    PsfElement, Pixelizer, RealPixelizer
 from .scene import SceneModel
 
 # If we are using autograd, then we need to use a special version of numpy.
@@ -220,11 +220,15 @@ class ExponentialPowerPsfElement(PsfElement):
         return fourier_profile
 
 
-class KolmogorovPsfElement(PsfElement):
+class KolmogorovPsfElement(ExponentialPowerPsfElement):
     """A Kolmogorov PSF.
 
     This is just an ExponentialPowerPsfElement with the power set to 5/3
     """
+    def _setup_parameters(self):
+        super(KolmogorovPsfElement, self)._setup_parameters()
+
+        self.fix(power=5./3.)
 
 
 class ChromaticExponentialPowerPsfElement(ExponentialPowerPsfElement):
@@ -290,3 +294,16 @@ class GaussianSceneModel(SceneModel):
         ]
 
         super(GaussianSceneModel, self).__init__(elements, *args, **kwargs)
+
+
+class KolmogorovSceneModel(SceneModel):
+    """A scene model of a point source convolved with a Kolmogorov PSF."""
+    def __init__(self, *args, **kwargs):
+        elements = [
+            PointSource,
+            KolmogorovPsfElement,
+            Pixelizer,
+            Background
+        ]
+
+        super(KolmogorovSceneModel, self).__init__(elements, *args, **kwargs)
