@@ -908,4 +908,5 @@ class PixelModelComponent(ModelElement):
 
         This must be implemented in subclasses.
         """
-        raise NotImplementedError()
+        raise NotImplementedError("_evaluate not implemented for %s"
+                                  % type(self))

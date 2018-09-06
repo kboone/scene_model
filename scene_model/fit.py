@@ -436,31 +436,9 @@ def _plot_correlation(instance, names=None, covariance=None, **kwargs):
     plt.colorbar()
 
 
-def _evaluate_priors(parameters, priors):
-    """Evaluate priors on a set of parameters.
-
-    parameters should be a dictionary of parameters with their corresponding
-    values.
-
-    priors should be a dictionary of the priors, with the dictionary entries
-    specifying the prior to use.
-    """
-    total_prior = 0.
-    for parameter, prior_dict in priors.items():
-        parameter_value = parameters[parameter]
-
-        center = prior_dict['value']
-        width = prior_dict['width']
-
-        # Gaussian prior
-        prior = (parameter_value - center)**2 / width**2
-        total_prior += prior
-
-    return total_prior
-
-
 class MultipleImageFitter():
-    def __init__(self, scene_model, images, variances=None, **kwargs):
+    def __init__(self, scene_model, images, variances=None, priors=[],
+                 **kwargs):
         """Initialze a fitter for multiple images.
 
         The fitter will fit a scene model to every image. scene_model is either
@@ -490,6 +468,15 @@ class MultipleImageFitter():
 
         self._base_scene_model = scene_model
         self.scene_models = scene_models
+
+        # Add in priors and set initial values from them.
+        self.priors = priors
+        if priors:
+            parameters = self.parameters
+            for prior in self.priors:
+                if prior.set_initial_values:
+                    parameters = prior.update_initial_values(self, parameters)
+            self.set_parameters(update_derived=False, **parameters)
 
         self._global_fit_parameters = OrderedDict()
         self._global_fixed_parameters = OrderedDict()
@@ -604,7 +591,8 @@ class MultipleImageFitter():
                 parameters,
                 do_analytic_coefficients=do_analytic_coefficients,
                 return_full_info=save_parameters,
-                apply_fit_scale=apply_fit_scale
+                apply_fit_scale=apply_fit_scale,
+                apply_priors=apply_priors,
             )
 
             if save_parameters:
@@ -616,10 +604,10 @@ class MultipleImageFitter():
             total_chi_square += model_chi_square
 
         if apply_priors:
-            # TODO: priors
-            # prior_penalty = self.evaluate_priors(global_parameters)
-            # total_chi_square += prior_penalty
-            pass
+            prior_penalty = 0.
+            for prior in self.priors:
+                prior_penalty += prior.evaluate(global_parameters)
+            total_chi_square += prior_penalty
 
         if save_parameters:
             # Save global parameters:
@@ -976,6 +964,33 @@ class MultipleImageFitter():
             parameters[key] = values
 
         return parameters
+
+    def set_parameters(self, update_derived=True, **kwargs):
+        for key, value in kwargs.items():
+            if key in self._global_fit_parameters:
+                # Global fit parameter. Set the value there since it overrides
+                # the model values.
+                self._global_fit_parameters[key] = value
+            else:
+                # Need to set the key on the models directly.
+                if np.isscalar(value):
+                    # Scalar, same for every model.
+                    for model in self.scene_models:
+                        model.set_parameters(update_derived=update_derived,
+                                             **{key: value})
+                else:
+                    # Array,different for each model.
+                    for model, model_value in zip(self.scene_models, value):
+                        model.set_parameters(update_derived=update_derived,
+                                             **{key: model_value})
+
+    def __getitem__(self, parameter):
+        """Return the value(s) of a given parameter"""
+        return self.parameters[parameter]
+
+    def __setitem__(self, parameter, value):
+        """Set the value of a given parameter"""
+        self.set_parameters(**{parameter: value})
 
     @property
     def degrees_of_freedom(self):

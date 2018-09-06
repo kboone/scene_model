@@ -37,7 +37,7 @@ class SceneModel(object):
     Finally, the Background element adds a background component to the model.
     """
     def __init__(self, elements, image=None, variance=None, grid_size=None,
-                 subsampling=config.default_subsampling,
+                 priors=[], subsampling=config.default_subsampling,
                  border=config.default_border, shared_parameters=[], **kwargs):
         """Initialize a scene model.
 
@@ -104,6 +104,10 @@ class SceneModel(object):
 
         # Clear the cache to set up cache-related structures.
         self.clear_cache()
+
+        # Add in priors and set initial values from them.
+        self.priors = priors
+        self.set_prior_initial_values()
 
     def _create_grid(self, grid_size, border, subsampling):
         """Create a grid that the model can be evaluated on.
@@ -234,6 +238,18 @@ class SceneModel(object):
         # setting a new grid.
         self.clear_cache()
 
+    def set_prior_initial_values(self):
+        """Set the initial values for parameters from the priors"""
+        if not self.priors:
+            # No priors, nothing to do.
+            return
+
+        parameters = self.parameters
+        for prior in self.priors:
+            if prior.set_initial_values:
+                parameters = prior.update_initial_values(self, parameters)
+        self.set_parameters(update_derived=False, **parameters)
+
     def load_image(self, image, variance=None, saturation_level=None,
                    apply_scale=True, set_initial_guesses=True,
                    amplitude_key='amplitude', background_key='background',
@@ -279,6 +295,9 @@ class SceneModel(object):
             for parameter_name, guess_name in guess_map.items():
                 if parameter_name in self._parameter_info:
                     self[parameter_name] = image_fit_data[guess_name]
+
+        # Update initial values from the priors
+        self.set_prior_initial_values()
 
     def _process_image(self, image, variance=None, saturation_level=None,
                        background_fraction=0.5):
@@ -631,10 +650,10 @@ class SceneModel(object):
         chi_square = np.sum((use_data - fit_model)**2 / use_variance)
 
         if apply_priors:
-            # TODO: priors
-            # prior_penalty = self.evaluate_priors(full_parameters)
-            # chi_square += prior_penalty
-            pass
+            prior_penalty = 0.
+            for prior in self.priors:
+                prior_penalty += prior.evaluate(full_parameters)
+            chi_square += prior_penalty
 
         if return_full_info:
             return_val = chi_square, fit_model, full_parameters

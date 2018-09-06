@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+from .prior import *
 from .scene import *
 from .fit import *
 from .element import *
