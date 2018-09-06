@@ -82,7 +82,7 @@ class SnifsAdrElement(ConvolutionElement):
         self._add_parameter('adr_theta', 0., (None, None), 'THETA',
                             'ADR theta parameter')
 
-    def _evaluate_fourier(self, wx, wy, subsampling, grid_info, wavelength,
+    def _evaluate_fourier(self, kx, ky, subsampling, grid_info, wavelength,
                           adr_delta, adr_theta, **kwargs):
         if wavelength is None:
             raise SceneModelException("Must set wavelength for %s!" %
@@ -96,7 +96,7 @@ class SnifsAdrElement(ConvolutionElement):
         shift_x = adr_delta * np.sin(adr_theta) * adr_scale
         shift_y = -adr_delta * np.cos(adr_theta) * adr_scale
 
-        shift_fourier = np.exp(-1j * (shift_x * wx + shift_y * wy))
+        shift_fourier = np.exp(-1j * (shift_x * kx + shift_y * ky))
 
         return shift_fourier
 
@@ -268,15 +268,15 @@ class TrackingEllipticityPsfElement(PsfElement):
         self._add_parameter('ell_coord_y', 0.1, (-30., 30.), 'ELLY',
                             'Ellipticity coordinate in Y direction')
 
-    def _evaluate_fourier(self, wx, wy, subsampling, grid_info, ell_coord_x,
+    def _evaluate_fourier(self, kx, ky, subsampling, grid_info, ell_coord_x,
                           ell_coord_y, **kwargs):
         # Infinitesimally small minor axis
         rho = 0.99
 
         gaussian = np.exp(-0.5 * (
-            wx**2 * ell_coord_x**2 +
-            wy**2 * ell_coord_y**2 +
-            2. * wx * wy * rho * ell_coord_x * ell_coord_y
+            kx**2 * ell_coord_x**2 +
+            ky**2 * ell_coord_y**2 +
+            2. * kx * ky * rho * ell_coord_x * ell_coord_y
         ))
 
         return gaussian

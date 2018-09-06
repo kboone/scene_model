@@ -18,11 +18,11 @@ class PointSource(SubsampledModelComponent):
         self._add_parameter('center_y', None, (None, None), 'POSY',
                             'Point source center position Y')
 
-    def _evaluate_fourier(self, wx, wy, subsampling, grid_info, amplitude,
+    def _evaluate_fourier(self, kx, ky, subsampling, grid_info, amplitude,
                           center_x, center_y, **kwargs):
         # A delta function is a complex exponential in Fourier space.
         point_source_fourier = amplitude * np.exp(
-            - 1j * (center_x * wx + center_y * wy)
+            - 1j * (center_x * kx + center_y * ky)
         )
 
         return point_source_fourier
@@ -161,12 +161,12 @@ class GaussianPsfElement(PsfElement):
 
         return gaussian
 
-    def _evaluate_fourier(self, wx, wy, subsampling, grid_info, sigma_x,
+    def _evaluate_fourier(self, kx, ky, subsampling, grid_info, sigma_x,
                           sigma_y, rho, **kwargs):
         gaussian = np.exp(-0.5 * (
-            wx**2 * sigma_x**2 +
-            wy**2 * sigma_y**2 +
-            2. * wx * wy * rho * sigma_x * sigma_y
+            kx**2 * sigma_x**2 +
+            ky**2 * sigma_y**2 +
+            2. * kx * ky * rho * sigma_x * sigma_y
         ))
 
         return gaussian
@@ -211,13 +211,20 @@ class ExponentialPowerPsfElement(PsfElement):
         self._add_parameter('power', 1.6, (0., 2.), 'POW', 'power')
         self._add_parameter('width', 0.5, (0.01, 30.), 'WID', 'width')
 
-    def _evaluate_fourier(self, wx, wy, subsampling, grid_info, power, width,
+    def _evaluate_fourier(self, kx, ky, subsampling, grid_info, power, width,
                           **kwargs):
-        wr = np.sqrt(wx*wx + wy*wy)
+        k = np.sqrt(kx*kx + ky*ky)
 
-        fourier_profile = np.exp(-width**power * wr**power)
+        fourier_profile = np.exp(-width**power * k**power)
 
         return fourier_profile
+
+
+class KolmogorovPsfElement(PsfElement):
+    """A Kolmogorov PSF.
+
+    This is just an ExponentialPowerPsfElement with the power set to 5/3
+    """
 
 
 class ChromaticExponentialPowerPsfElement(ExponentialPowerPsfElement):

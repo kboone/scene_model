@@ -492,8 +492,8 @@ class SubsampledModelElement(ModelElement):
             )
 
         fourier_element = self._evaluate_fourier(
-            grid_info['pad_grid_wx'],
-            grid_info['pad_grid_wy'],
+            grid_info['pad_grid_kx'],
+            grid_info['pad_grid_ky'],
             subsampling,
             grid_info,
             **parameters
@@ -503,8 +503,8 @@ class SubsampledModelElement(ModelElement):
 
         return real_element
 
-    def _evaluate_fourier(self, wx, wy, subsampling, grid_info, **parameters):
-        """Evaluate the element in Fourier space at a set of wx and wy
+    def _evaluate_fourier(self, kx, ky, subsampling, grid_info, **parameters):
+        """Evaluate the element in Fourier space at a set of kx and ky
         frequencies with the given parameters.
 
         See _evaluate for details.
@@ -563,14 +563,14 @@ class SubsampledModelElement(ModelElement):
 
         return result
 
-    def _cache_evaluate_fourier(self, wx, wy, subsampling, grid_info,
+    def _cache_evaluate_fourier(self, kx, ky, subsampling, grid_info,
                                 parameters):
         """Cache Fourier evaluations of this element.
 
         This is just a wrapper around _cache_evaluate with mode set to fourier.
         See it for details.
         """
-        return self._cache_evaluate(wx, wy, subsampling, grid_info, parameters,
+        return self._cache_evaluate(kx, ky, subsampling, grid_info, parameters,
                                     mode='fourier')
 
     def _has_real_evaluate(self):
@@ -617,8 +617,8 @@ class SubsampledModelComponent(SubsampledModelElement):
             )
         elif mode == 'fourier':
             components = self._cache_evaluate_fourier(
-                grid_info['pad_grid_wx'],
-                grid_info['pad_grid_wy'],
+                grid_info['pad_grid_kx'],
+                grid_info['pad_grid_ky'],
                 grid_info['subsampling'],
                 grid_info,
                 parameters
@@ -673,8 +673,8 @@ class ConvolutionElement(SubsampledModelElement):
                                       "models in mode %s!" % mode)
 
         convolve_image = self._cache_evaluate_fourier(
-            grid_info['pad_grid_wx'],
-            grid_info['pad_grid_wy'],
+            grid_info['pad_grid_kx'],
+            grid_info['pad_grid_ky'],
             grid_info['subsampling'],
             grid_info,
             parameters
@@ -727,8 +727,8 @@ class Pixelizer(ModelElement):
             raise SceneModelException("Pixelizer can't be applied to models "
                                       "in mode %s!" % mode)
 
-        wx = grid_info['pad_grid_wx']
-        wy = grid_info['pad_grid_wy']
+        kx = grid_info['pad_grid_kx']
+        ky = grid_info['pad_grid_ky']
         subsampling = grid_info['subsampling']
         border = grid_info['border']
 
@@ -736,8 +736,8 @@ class Pixelizer(ModelElement):
         fourier_subpixel = self.get_cache(
             'fourier_pixel',
             calculator=lambda: (
-                np.sinc(wx / np.pi / 2. / subsampling) *
-                np.sinc(wy / np.pi / 2. / subsampling)
+                np.sinc(kx / np.pi / 2. / subsampling) *
+                np.sinc(ky / np.pi / 2. / subsampling)
             ),
             grid_info_str=grid_info['unique_str']
         )

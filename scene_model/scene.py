@@ -148,15 +148,15 @@ class SceneModel(object):
         pad_grid_x, pad_grid_y = np.meshgrid(pad_range_x, pad_range_y,
                                              indexing='ij')
 
-        wx = 2 * np.pi * np.fft.fftfreq(pad_grid_x.shape[0], step)
-        wy = 2 * np.pi * np.fft.fftfreq(pad_grid_x.shape[1], step)
-        pad_grid_wx, pad_grid_wy = np.meshgrid(wx, wy, indexing='ij')
+        kx = 2 * np.pi * np.fft.fftfreq(pad_grid_x.shape[0], step)
+        ky = 2 * np.pi * np.fft.fftfreq(pad_grid_x.shape[1], step)
+        pad_grid_kx, pad_grid_ky = np.meshgrid(kx, ky, indexing='ij')
 
         subsampling_buffer = subsampling_buffer
         pad_grid_x = pad_grid_x
         pad_grid_y = pad_grid_y
-        pad_grid_wx = pad_grid_wx
-        pad_grid_wy = pad_grid_wy
+        pad_grid_kx = pad_grid_kx
+        pad_grid_ky = pad_grid_ky
 
         # Calculate the offset that the center position needs to be moved by to
         # be in the right location on the padded grid.
@@ -166,7 +166,7 @@ class SceneModel(object):
         # Calculate the Fourier shift that needs to be applied to get an FFTed
         # Fourier space model to the reference position and back.
         pad_ifft_shift = np.exp(
-            - 1j * (pad_offset_x * pad_grid_wx + pad_offset_y * pad_grid_wy)
+            - 1j * (pad_offset_x * pad_grid_kx + pad_offset_y * pad_grid_ky)
         )
         pad_fft_shift = np.conj(pad_ifft_shift)
 
@@ -193,8 +193,8 @@ class SceneModel(object):
             'subsampling_buffer': subsampling_buffer,
             'pad_grid_x': pad_grid_x,
             'pad_grid_y': pad_grid_y,
-            'pad_grid_wx': pad_grid_wx,
-            'pad_grid_wy': pad_grid_wy,
+            'pad_grid_kx': pad_grid_kx,
+            'pad_grid_ky': pad_grid_ky,
 
             'pad_offset_x': pad_offset_x,
             'pad_offset_y': pad_offset_y,
