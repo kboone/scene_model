@@ -68,6 +68,7 @@ class SceneModel(object):
         self.border = border
 
         self.elements = []
+        self.priors = priors
         self.shared_parameters = shared_parameters
 
         for element in elements:
@@ -104,10 +105,6 @@ class SceneModel(object):
 
         # Clear the cache to set up cache-related structures.
         self.clear_cache()
-
-        # Add in priors and set initial values from them.
-        self.priors = priors
-        self.set_prior_initial_values()
 
     def _create_grid(self, grid_size, border, subsampling):
         """Create a grid that the model can be evaluated on.
