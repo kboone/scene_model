@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+from __future__ import print_function
+
 from . import config
 from .utils import SceneModelException
 from .element import ConvolutionElement, PsfElement, Pixelizer, RealPixelizer
@@ -6,9 +8,11 @@ from .scene import SceneModel
 from .models import GaussianMoffatPsfElement, \
     PointSource, \
     Background, \
+    PolynomialBackground, \
     GaussianPsfElement, \
     ExponentialPowerPsfElement, \
     ChromaticExponentialPowerPsfElement
+from .prior import GaussianPrior, MultivariateGaussianPrior
 
 # If we are using autograd, then we need to use a special version of numpy.
 from .config import numpy as np
@@ -48,6 +52,26 @@ def read_pressure_and_temperature(header, mauna_kea_pressure=616.,
         temperature = mauna_kea_temperature
 
     return pressure, temperature
+
+
+def estimate_zenithal_parallactic(header):
+    """
+    Estimate zenithal distance [deg] and parallactic angle [deg] from header.
+
+    modified from libExtractStar.py
+    """
+    from ToolBox.Astro import Coords
+
+    ha, dec = Coords.altaz2hadec(
+        header['ALTITUDE'], header['AZIMUTH'], phi=header['LATITUDE'],
+        deg=True
+    )
+
+    zd, parangle = Coords.hadec2zdpar(
+        ha, dec, phi=header['LATITUDE'], deg=True
+    )
+
+    return zd, parangle
 
 
 class SnifsAdrElement(ConvolutionElement):
@@ -282,10 +306,98 @@ class TrackingEllipticityPsfElement(PsfElement):
         return gaussian
 
 
+class SnifsFourierSeeingPrior(GaussianPrior):
+    """Add a prior on the seeing of this image to the model.
+
+    The seeing_width parameter sets the seeing of the model. The relationship
+    between this parameter and the seeing estimate from the SNIFS instrument
+    was measured from a large set of extractions of standard stars on all
+    photometric nights.
+    """
+    def __init__(self, seeing, seeing_key='seeing_width', **kwargs):
+        predicted_width = -0.342 + 0.914 * seeing
+        dispersion = 0.079
+
+        super(SnifsFourierSeeingPrior, self).__init__(
+            seeing_key, predicted_width, dispersion, **kwargs
+        )
+
+
+class SnifsFourierEllipticityPrior(MultivariateGaussianPrior):
+    """Add a prior on the ellipticity to the model.
+
+    The ellipticity is primarily affected by the airmass. I determined a
+    relationship for this from a set of standard stars. Note that this relation
+    should really only be applied to long exposures, short exposures have a
+    very different dependence. It doesn't really matter because the short
+    exposures are so bright that they blow away the prior anyway, but I should
+    figure out how to deal with this.
+    """
+    def __init__(self, channel, airmass, **kwargs):
+        if channel == 'B':
+            intercept_x, slope_x, dispersion_x = [+0.600, -0.179, 0.222]
+            intercept_y, slope_y, dispersion_y = [-0.110, +0.150, 0.147]
+        elif channel == 'R':
+            intercept_x, slope_x, dispersion_x = [+0.576, -0.185, 0.223]
+            intercept_y, slope_y, dispersion_y = [-0.123, +0.166, 0.146]
+        else:
+            raise SceneModelException("Unknown channel %s" % channel)
+
+        predicted_ell_x = intercept_x + slope_x * airmass
+        predicted_ell_y = intercept_y + slope_y * airmass
+
+        keys = ['ell_width_x', 'ell_width_y']
+        central_values = [predicted_ell_x, predicted_ell_y]
+        covariance = [[dispersion_x**2, 0], [0, dispersion_y**2]]
+
+        super(SnifsFourierEllipticityPrior, self).__init__(
+            keys, central_values, covariance, **kwargs
+        )
+
+
+class SnifsAdrPrior(MultivariateGaussianPrior):
+    """Add a prior on the ADR to the model.
+
+    The values here were determined by Yannick in the "faint standard star
+    ad-hoc analysis (adr.py and runaway.py)". airmass and parang should be
+    values from a fits header.
+    """
+    def __init__(self, channel, airmass, parang, **kwargs):
+        if channel == 'B':
+            dispersion_delta, dispersion_theta = [0.0173, 0.02882]
+            ddelta_zp, ddelta_slope = [0.00766, -0.00734]
+            dtheta_zp, dtheta_slope = [3.027, -0.554]   # deg
+        elif channel == 'R':
+            dispersion_delta, dispersion_theta = [0.0122, 0.02536]
+            ddelta_zp, ddelta_slope = [0.00075, 0.04674]
+            dtheta_zp, dtheta_slope = [4.447, 3.078]    # deg
+        else:
+            raise SceneModelException("Unknown channel %s" % channel)
+
+        rad_to_deg = 180. / np.pi
+
+        header_delta = np.tan(np.arccos(1. / airmass))
+        header_theta = parang / rad_to_deg
+
+        sinpar = np.sin(header_theta)
+        cospar = np.cos(header_theta)
+
+        predicted_delta = header_delta + ddelta_zp + ddelta_slope * sinpar
+        predicted_theta = header_theta + dtheta_zp + dtheta_slope * cospar
+
+        keys = ['adr_delta', 'adr_theta']
+        central_values = [predicted_delta, predicted_theta]
+        covariance = [[dispersion_delta**2, 0], [0, dispersion_theta**2]]
+
+        super(SnifsAdrPrior, self).__init__(
+            keys, central_values, covariance, **kwargs
+        )
+
+
 class SnifsFourierSceneModel(SceneModel):
     """A model of the PSF for the SNIFS IFU.
 
-    This model was empirically determined, and it contains:
+    This model was empirically constructed, and it contains:
     - a Gaussian instrumental core
     - a wide tail for the instrumental core
     - a Kolmogorov-like seeing term (with a variable exponent that doesn't
@@ -298,11 +410,16 @@ class SnifsFourierSceneModel(SceneModel):
     case an ADR model is used to determine the position of the point source as
     a function of wavelength and a power law is used to determine the seeing
     variation with wavelength.
+
+    The background degree specifies which background model to use. If
+    background_degree is an integer greater than zero, then a polynomial
+    background of that order is used. If background_degree is 0, a flat
+    background is used. If background_degree is -1, no background is used.
     """
     def __init__(self, image=None, variance=None,
                  use_empirical_parameters=True, wavelength_dependence=False,
-                 adr_model=None, spaxel_size=None, pressure=None,
-                 temperature=None, **kwargs):
+                 adr_model=None, background_degree=0, spaxel_size=None,
+                 pressure=None, temperature=None, **kwargs):
         """Build the elements of the PSF model.
 
         If use_empirical_parameters is True, then the instrumental parameters
@@ -369,10 +486,27 @@ class SnifsFourierSceneModel(SceneModel):
         # Background. The background is a slowly varying function, and doesn't
         # need to be convolved with the PSF or with the pixel. We apply it
         # after pixelization.
-        background_element = Background()
-        elements.append(background_element)
+        if background_degree == 0:
+            # Flat background
+            background_element = Background()
+        elif background_degree > 0:
+            # Polynomial background
+            background_element = PolynomialBackground(
+                background_degree=background_degree
+            )
+        elif background_element == -1:
+            # No background
+            background_element = None
+        else:
+            raise SceneModelException("Unknown background_degree %d!" %
+                                      background_degree)
+
+        if background_element is not None:
+            elements.append(background_element)
 
         if wavelength_dependence:
+            # Several elements need access to the wavelength parameter. Make
+            # sure that it is shared across them.
             shared_parameters = ['wavelength']
         else:
             shared_parameters = []
