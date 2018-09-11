@@ -9,4 +9,5 @@ setup(
     author='Kyle Boone',
     author_email='kboone@berkeley.edu',
     packages=['scene_model'],
+    scripts=['scripts/extract_star2.py'],
 )

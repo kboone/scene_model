@@ -74,6 +74,64 @@ def estimate_zenithal_parallactic(header):
     return zd, parangle
 
 
+def estimate_adr_parameters(header, return_dispersions=False):
+    """
+    Estimate ADR parameters delta and theta [rad] from the airmass and
+    parallactic angle in a SNIFS fits header.
+    """
+    channel = header['CHANNEL']
+    header_airmass = header['AIRMASS']
+    header_parang = header['PARANG']
+
+    if channel == 'B':
+        dispersion_delta, dispersion_theta = [0.0173, 0.02882]
+        ddelta_zp, ddelta_slope = [0.00766, -0.00734]
+        dtheta_zp, dtheta_slope = [3.027, -0.554]   # deg
+    elif channel == 'R':
+        dispersion_delta, dispersion_theta = [0.0122, 0.02536]
+        ddelta_zp, ddelta_slope = [0.00075, 0.04674]
+        dtheta_zp, dtheta_slope = [4.447, 3.078]    # deg
+    else:
+        raise SceneModelException("Unknown channel %s" % channel)
+
+    rad_to_deg = 180. / np.pi
+
+    header_delta = np.tan(np.arccos(1. / header_airmass))
+    header_theta = header_parang / rad_to_deg
+
+    sinpar = np.sin(header_theta)
+    cospar = np.cos(header_theta)
+
+    predicted_delta = header_delta + ddelta_zp + ddelta_slope * sinpar
+    predicted_theta = header_theta + dtheta_zp + dtheta_slope * cospar
+
+    if return_dispersions:
+        return predicted_delta, predicted_theta, dispersion_delta, \
+            dispersion_theta
+    else:
+        return predicted_delta, predicted_theta
+
+
+def build_adr_model(pressure, temperature, delta=None, theta=None,
+                    reference_wavelength=config.reference_wavelength):
+    """Load an ADR model for the PSF."""
+    from ToolBox.Atmosphere import ADR
+    adr_model = ADR(pressure, temperature, lref=reference_wavelength,
+                    delta=delta, theta=theta)
+
+    return adr_model
+
+
+def build_adr_model_from_header(header, **kwargs):
+    """Build an ADR model from a SNIFS fits header"""
+    pressure, temperature = read_pressure_and_temperature(header)
+    delta, theta = estimate_adr_parameters(header)
+
+    adr_model = build_adr_model(pressure, temperature, delta, theta, **kwargs)
+
+    return adr_model
+
+
 class SnifsAdrElement(ConvolutionElement):
     """A PsfElement that applies atmospheric differential refraction to a
     scene.
@@ -124,6 +182,19 @@ class SnifsAdrElement(ConvolutionElement):
 
         return shift_fourier
 
+    def set_parameters(self, update_derived=True, **kwargs):
+        """Update the delta and theta parameters of the ADR model."""
+        for key, value in kwargs.items():
+            if key == 'adr_delta':
+                self.adr_model.set_param(delta=value)
+            elif key == 'adr_theta':
+                self.adr_model.set_param(theta=value)
+
+        # Do the standard set_parameters
+        super(SnifsAdrElement, self).set_parameters(
+            update_derived=update_derived, **kwargs
+        )
+
     def set_adr(self, adr_model, spaxel_size):
         """Set the ADR model to one that has already been created."""
         # Make sure that we passed both the adr model and the spaxel size
@@ -138,15 +209,27 @@ class SnifsAdrElement(ConvolutionElement):
 
     def load_adr(self, pressure, temperature, spaxel_size):
         """Load an ADR model for the PSF."""
-
         if pressure is None or temperature is None or spaxel_size is None:
             raise SceneModelException(
                 "Must specify all of pressure, temperature and spaxel_size."
             )
 
-        from ToolBox.Atmosphere import ADR
-        self.adr_model = ADR(pressure, temperature)
+        adr_model = build_adr_model(pressure, temperature, delta=self['delta'],
+                                    theta=self['theta'])
+
+        self.adr_model = adr_model
         self.spaxel_size = spaxel_size
+
+    def from_fits_header(cls, header, spaxel_size, **kwargs):
+        """Load the ADR model from a SNIFS fits header.
+
+        This only uses header parameters that come directly from the
+        instrument, and can be used for any SNIFS cube.
+        """
+        adr_model = build_adr_model_from_header(header)
+        element = cls(adr_model=adr_model, spaxel_size=spaxel_size, **kwargs)
+
+        return element
 
 
 class SnifsOldPsfElement(GaussianMoffatPsfElement):
@@ -360,38 +443,33 @@ class SnifsAdrPrior(MultivariateGaussianPrior):
 
     The values here were determined by Yannick in the "faint standard star
     ad-hoc analysis (adr.py and runaway.py)". airmass and parang should be
-    values from a fits header.
+    values from a fits header, and can be automatically read with
+    from_fits_header.
     """
-    def __init__(self, channel, airmass, parang, **kwargs):
-        if channel == 'B':
-            dispersion_delta, dispersion_theta = [0.0173, 0.02882]
-            ddelta_zp, ddelta_slope = [0.00766, -0.00734]
-            dtheta_zp, dtheta_slope = [3.027, -0.554]   # deg
-        elif channel == 'R':
-            dispersion_delta, dispersion_theta = [0.0122, 0.02536]
-            ddelta_zp, ddelta_slope = [0.00075, 0.04674]
-            dtheta_zp, dtheta_slope = [4.447, 3.078]    # deg
-        else:
-            raise SceneModelException("Unknown channel %s" % channel)
-
-        rad_to_deg = 180. / np.pi
-
-        header_delta = np.tan(np.arccos(1. / airmass))
-        header_theta = parang / rad_to_deg
-
-        sinpar = np.sin(header_theta)
-        cospar = np.cos(header_theta)
-
-        predicted_delta = header_delta + ddelta_zp + ddelta_slope * sinpar
-        predicted_theta = header_theta + dtheta_zp + dtheta_slope * cospar
-
+    def __init__(self, center_delta, center_theta, dispersion_delta,
+                 dispersion_theta, **kwargs):
         keys = ['adr_delta', 'adr_theta']
-        central_values = [predicted_delta, predicted_theta]
+        central_values = [center_delta, center_theta]
         covariance = [[dispersion_delta**2, 0], [0, dispersion_theta**2]]
 
         super(SnifsAdrPrior, self).__init__(
             keys, central_values, covariance, **kwargs
         )
+
+    @classmethod
+    def from_fits_header(cls, header, **kwargs):
+        """Load the prior from a SNIFS fits header.
+
+        This only uses header parameters that come directly from the
+        instrument, and can be used for any SNIFS cube.
+        """
+        center_delta, center_theta, dispersion_delta, dispersion_theta = \
+            estimate_adr_parameters(header, return_dispersions=True)
+
+        prior = cls(center_delta, center_theta, dispersion_delta,
+                    dispersion_theta, **kwargs)
+
+        return prior
 
 
 class SnifsFourierSceneModel(SceneModel):
