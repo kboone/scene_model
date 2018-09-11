@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+from __future__ import print_function
+
 import sys
 
 # If we are using autograd, then we need to use a special version of numpy.

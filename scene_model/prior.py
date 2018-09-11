@@ -1,4 +1,8 @@
 # -*- coding: utf-8 -*-
+from __future__ import print_function
+
+from scipy.linalg import pinvh
+
 from . import config
 from .utils import SceneModelException
 
@@ -67,3 +71,46 @@ class GaussianPrior(Prior):
         current_value = parameters[self.parameter_name]
 
         return (current_value - self.central_value)**2 / self.sigma**2
+
+
+class MultivariateGaussianPrior(Prior):
+    def __init__(self, parameter_names, central_values, covariance, **kwargs):
+        super(MultivariateGaussianPrior, self).__init__(**kwargs)
+
+        self.parameter_names = parameter_names
+        self.central_values = np.asarray(central_values)
+
+        self.update_covariance(covariance)
+
+    def update_covariance(self, covariance):
+        """Save the covariance and derived terms that are needed to evaluate
+        the PDF of this prior
+        """
+        self.covariance = covariance
+
+        self.inv_covariance = pinvh(covariance)
+
+    def update_initial_values(self, instance, parameters):
+        for parameter_name, central_value in zip(self.parameter_names,
+                                                 self.central_values):
+            parameters[parameter_name] = central_value
+
+        return parameters
+
+    def evaluate(self, parameters):
+        """Evaluate a Multivariate Gaussian prior.
+
+        As we work with chi-squares here, we use the analog for a multivariate
+        Gaussian of dx' * cov^-1 * dx.
+        """
+        current_values = []
+        for parameter_name in self.parameter_names:
+            current_value = parameters[parameter_name]
+            current_values.append(current_value)
+
+        current_values = np.asarray(current_values)
+
+        diff = current_values - self.central_values
+        chisq = self.inv_covariance.dot(diff).dot(diff)
+
+        return chisq

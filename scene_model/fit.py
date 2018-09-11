@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+from __future__ import print_function
+
 from scipy.optimize import minimize
 from collections import OrderedDict
 from scipy.linalg import pinvh, LinAlgError

@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+from __future__ import print_function
+
 from . import config
 from .utils import SceneModelException
 from .element import SubsampledModelComponent, PixelModelComponent, \
