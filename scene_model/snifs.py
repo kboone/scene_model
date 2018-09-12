@@ -249,7 +249,17 @@ def write_pysnifs_spectrum(spectrum, path=None, header=None):
         hduList.append(hducov)
 
     if path:                        # Save hduList to disk
-        hduList.writeto(path, output_verify='silentfix', clobber=True)
+        # writeto uses the clobber keyword for astropy < 1.3, and the overwrite
+        # keyword for astropy >= 1.3. Unfortunately the CC is on astropy 1.0,
+        # so we need to pick the right one.
+        import astropy
+        from distutils.version import LooseVersion
+        astropy_version = LooseVersion(astropy.__version__)
+        change_version = LooseVersion('1.3')
+        if astropy_version >= change_version:
+            hduList.writeto(path, output_verify='silentfix', overwrite=True)
+        else:
+            hduList.writeto(path, output_verify='silentfix', clobber=True)
 
     return hduList                  # For further handling if needed
 
@@ -1416,7 +1426,7 @@ class SnifsCubeFitter(object):
         print("TODO: add prior info to header")
 
         # Save the point source spectrum
-        print("Saving ouptut point-source spectrum to '%s'" % output_path)
+        print("Saving output point-source spectrum to '%s'" % output_path)
         point_source_spectrum = pySNIFS.spectrum(
             data=self.extraction['amplitude'],
             var=self.extraction['amplitude_variance'],
@@ -1426,7 +1436,7 @@ class SnifsCubeFitter(object):
         write_pysnifs_spectrum(point_source_spectrum, output_path, header)
 
         # Save the sky spectrum
-        print("Saving ouptut sky spectrum to '%s'" % sky_output_path)
+        print("Saving output sky spectrum to '%s'" % sky_output_path)
         sky_spectrum = pySNIFS.spectrum(
             data=self.extraction['background_density'],
             var=self.extraction['background_density_variance'],
