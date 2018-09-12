@@ -238,58 +238,6 @@ def create_3Dlog(opts, cube, cube_fit, fitpar, dfitpar, chi2):
     logfile.close()
 
 
-def fill_header(hdr, psf, adr, cube, opts, chi2, seeing, posprior, fluxes):
-    """Fill header *hdr* with PSF fit-related keywords."""
-
-    # Convert reference position from lmid = (lmin+lmax)/2 to reference
-    # wavelength
-    lmin, lmax = cube.lstart, cube.lend   # 1st and last meta-slice wavelength
-    xref, yref = adr.refract(psf['ref_center_x'], psf['ref_center_y'],
-                             reference_wavelength, unit=cube.spxSize)
-    print_msg("Ref. position [%.0f A]: %+.2f x %+.2f spx" %
-              (reference_wavelength, xref, yref), 0)
-
-    # "[short|long], classic[-powerlaw]" or "[long|short] [blue|red],
-    # chromatic"
-    # psfname = ', '.join((psf.name, psf.model))
-    psfname = 'TODO'
-
-    psf_items = psf.get_fits_header_items()
-
-    for key, value, description in psf_items:
-        hdr[key] = (value, description)
-
-    hdr['ES_VERS'] = __version__
-    hdr['ES_CUBE'] = (opts.input, 'Input cube')
-    hdr['ES_LREF'] = (reference_wavelength, 'Lambda ref. [A]')
-    hdr['ES_CHI2'] = (chi2, 'Chi2|RSS of 3D-fit')
-    hdr['ES_AIRM'] = (adr.get_airmass(), 'Effective airmass')
-    hdr['ES_PARAN'] = (adr.get_parangle(), 'Effective parangle [deg]')
-    hdr['ES_LMIN'] = (lmin, 'Meta-slices minimum lambda')
-    hdr['ES_LMAX'] = (lmax, 'Meta-slices maximum lambda')
-
-    hdr['ES_METH'] = (opts.method, 'Extraction method')
-    hdr['ES_PSF'] = (psfname, 'PSF model name')
-    hdr['ES_SUB'] = (psf.subsampling, 'PSF subsampling')
-    if opts.method.endswith('aperture'):
-        hdr['ES_APRAD'] = (opts.radius, 'Aperture radius [" or sigma]')
-
-    tflux, sflux = fluxes       # Total point-source and sky fluxes
-    hdr['ES_TFLUX'] = (tflux, 'Total point-source flux')
-    if sflux:
-        hdr['ES_SFLUX'] = (sflux, 'Total sky flux/arcsec^2')
-
-    hdr['SEEING'] = (seeing, 'Estimated seeing @lbdaRef ["] (extract_star2)')
-
-    if opts.usePriors:
-        hdr['ES_PRIOR'] = (opts.usePriors, 'PSF prior hyper-scale')
-        if opts.seeingPrior is not None:
-            hdr['ES_PRISE'] = (opts.seeingPrior, 'Seeing prior [arcsec]')
-    if opts.psf3Dconstraints:
-        for i, constraint in enumerate(opts.psf3Dconstraints):
-            hdr['ES_BND%d' % (i + 1)] = (constraint, "Constraint on 3D-PSF")
-
-
 # ########## MAIN ##############################
 
 if __name__ == "__main__":
