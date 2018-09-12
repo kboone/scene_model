@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 from __future__ import print_function
 
+__version__ = "0.1"
+__author__ = "K. Boone, Y. Copin, C. Buton, E. Pecontal"
+
 ###############################################################################
 # Hardcoded configuration for SNIFS. This might need to be updated for other
 # instruments.

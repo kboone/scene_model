@@ -1,8 +1,23 @@
 # -*- coding: utf-8 -*-
 from __future__ import print_function
 
+import os
+from astropy.io import fits
+from astropy.table import Table
+from scipy.optimize import leastsq
+
+# Import SNIFS libraries if available.
+try:
+    from ToolBox.Arrays import metaslice
+    from ToolBox.Astro import Coords
+    from ToolBox.Atmosphere import ADR
+    import pySNIFS
+except ImportError as e:
+    print("WARNING: Unable to load SNIFS libraries! (%s)" % e.message)
+    print("Some functionality will be disabled.")
+
 from . import config
-from .utils import SceneModelException
+from .utils import SceneModelException, extract_key, nmad
 from .element import ConvolutionElement, PsfElement, Pixelizer, RealPixelizer
 from .scene import SceneModel
 from .models import GaussianMoffatPsfElement, \
@@ -11,11 +26,16 @@ from .models import GaussianMoffatPsfElement, \
     PolynomialBackground, \
     GaussianPsfElement, \
     ExponentialPowerPsfElement, \
-    ChromaticExponentialPowerPsfElement
+    ChromaticExponentialPowerPsfElement, \
+    GaussianSceneModel
+from .fit import MultipleImageFitter
 from .prior import GaussianPrior, MultivariateGaussianPrior
 
 # If we are using autograd, then we need to use a special version of numpy.
 from .config import numpy as np
+
+
+rad_to_deg = 180. / np.pi
 
 
 def read_pressure_and_temperature(header, mauna_kea_pressure=616.,
@@ -60,8 +80,6 @@ def estimate_zenithal_parallactic(header):
 
     modified from libExtractStar.py
     """
-    from ToolBox.Astro import Coords
-
     ha, dec = Coords.altaz2hadec(
         header['ALTITUDE'], header['AZIMUTH'], phi=header['LATITUDE'],
         deg=True
@@ -94,16 +112,17 @@ def estimate_adr_parameters(header, return_dispersions=False):
     else:
         raise SceneModelException("Unknown channel %s" % channel)
 
-    rad_to_deg = 180. / np.pi
-
     header_delta = np.tan(np.arccos(1. / header_airmass))
     header_theta = header_parang / rad_to_deg
 
     sinpar = np.sin(header_theta)
     cospar = np.cos(header_theta)
 
-    predicted_delta = header_delta + ddelta_zp + ddelta_slope * sinpar
-    predicted_theta = header_theta + dtheta_zp + dtheta_slope * cospar
+    correction_delta = ddelta_zp + ddelta_slope * sinpar
+    correction_theta = (dtheta_zp + dtheta_slope * cospar) / rad_to_deg
+
+    predicted_delta = header_delta + correction_delta
+    predicted_theta = header_theta + correction_theta
 
     if return_dispersions:
         return predicted_delta, predicted_theta, dispersion_delta, \
@@ -115,7 +134,6 @@ def estimate_adr_parameters(header, return_dispersions=False):
 def build_adr_model(pressure, temperature, delta=None, theta=None,
                     reference_wavelength=config.reference_wavelength):
     """Load an ADR model for the PSF."""
-    from ToolBox.Atmosphere import ADR
     adr_model = ADR(pressure, temperature, lref=reference_wavelength,
                     delta=delta, theta=theta)
 
@@ -130,6 +148,139 @@ def build_adr_model_from_header(header, **kwargs):
     adr_model = build_adr_model(pressure, temperature, delta, theta, **kwargs)
 
     return adr_model
+
+
+def cube_to_arrays(cube):
+    """Convert a SNIFS cube into two 3d numpy arrays with the data and
+    variance.
+
+    Any invalid spaxels or ones that aren't present are set to np.nan in the
+    cube.
+    """
+    size_x = np.max(cube.i) + 1
+    size_y = np.max(cube.j) + 1
+
+    data = np.zeros((cube.data.shape[0], size_x, size_y))
+    data[...] = np.nan
+    data[:, cube.i, cube.j] = cube.data
+
+    var = np.zeros(data.shape)
+    var[...] = np.nan
+    var[:, cube.i, cube.j] = cube.var
+
+    return data, var
+
+
+def evaluate_power_law(coefficients, x):
+    """Evaluate (curved) power-law: coefficients[-1] * x**(coefficients[-2] +
+    coefficients[-3]*(x-1) + ...)
+
+    Note that f(1) = coefficients[-1] = f(lref) with x = lbda/lref.
+    """
+    return coefficients[-1] * x**np.polyval(coefficients[:-1], x - 1)
+
+
+def power_law_jacobian(coeffs, x):
+    ncoeffs = len(coeffs)                               # M
+    jac = np.empty((ncoeffs, len(x)), dtype=x.dtype)    # M×N
+    jac[-1] = x**np.polyval(coeffs[:-1], x - 1)         # df/dcoeffs[-1]
+    jac[-2] = coeffs[-1] * jac[-1] * np.log(x)          # df/dcoeffs[-2]
+    for i in range(-3, -ncoeffs - 1, -1):
+        jac[i] = jac[i + 1] * (x - 1)
+
+    return jac                                          # M×N
+
+
+def fit_power_law(x, y, deg=2, guess=None):
+    import ToolBox.Optimizer as TO
+    if guess is None:
+        guess = [0.] * (deg - 1) + [-1., 2.]
+    else:
+        assert len(guess) == (deg + 1)
+
+    model = TO.Model(evaluate_power_law, jac=power_law_jacobian)
+    data = TO.DataSet(y, x=x)
+    fit = TO.Fitter(model, data)
+    lsqPars, msg = leastsq(fit.residuals, guess, args=(x,))
+
+    if msg <= 4:
+        return lsqPars
+    else:
+        raise SceneModelException("fit_power_law did not converge")
+
+
+def write_pysnifs_spectrum(spectrum, path=None, header=None):
+    """Write a pySNIFS spectrum to a fits file at the given path.
+
+    This was adapted from extract_star.py
+
+    This allows full header propagation (including comments) and covariance
+    matrix storage.
+    """
+    assert not (spectrum.start is None or spectrum.step is None or
+                spectrum.data is None)
+
+    # Primary HDU: signal
+    hdusig = fits.PrimaryHDU(spectrum.data, header=header)
+    for key in ['EXTNAME', 'CTYPES', 'CRVALS', 'CDELTS', 'CRPIXS']:
+        if key in hdusig.header:
+            del(hdusig.header[key])  # Remove technical keys from E3D cube
+    hdusig.header.set('CRVAL1', spectrum.start, after='NAXIS1')
+    hdusig.header.set('CDELT1', spectrum.step, after='CRVAL1')
+
+    hduList = fits.HDUList([hdusig])
+
+    # 1st extension 'VARIANCE': variance
+    if spectrum.has_var:
+        hduvar = fits.ImageHDU(spectrum.var, name='VARIANCE')
+        hduvar.header['CRVAL1'] = spectrum.start
+        hduvar.header['CDELT1'] = spectrum.step
+
+        hduList.append(hduvar)
+
+    # 2nd (compressed) extension 'COVAR': covariance (lower triangle)
+    if hasattr(spectrum, 'cov'):
+        hducov = fits.ImageHDU(np.tril(spectrum.cov), name='COVAR')
+        hducov.header['CRVAL1'] = spectrum.start
+        hducov.header['CDELT1'] = spectrum.step
+        hducov.header['CRVAL2'] = spectrum.start
+        hducov.header['CDELT2'] = spectrum.step
+
+        hduList.append(hducov)
+
+    if path:                        # Save hduList to disk
+        hduList.writeto(path, output_verify='silentfix', clobber=True)
+
+    return hduList                  # For further handling if needed
+
+
+def get_background_element(background_degree):
+    """Set up a background element for a given degree.
+
+    The background degree is specified as follows:
+    - background_degree = 0: a flat background
+    - background_degree >= 1: a polynomial background of the specified order.
+    - background_degree = -1: no background.
+
+    Note that the background elements returned by this function are all applied
+    after pixelization.
+    """
+    if background_degree == 0:
+        # Flat background
+        background_element = Background()
+    elif background_degree > 0:
+        # Polynomial background
+        background_element = PolynomialBackground(
+            background_degree=background_degree
+        )
+    elif background_element == -1:
+        # No background
+        background_element = None
+    else:
+        raise SceneModelException("Unknown background_degree %d!" %
+                                  background_degree)
+
+    return background_element
 
 
 class SnifsAdrElement(ConvolutionElement):
@@ -232,7 +383,7 @@ class SnifsAdrElement(ConvolutionElement):
         return element
 
 
-class SnifsOldPsfElement(GaussianMoffatPsfElement):
+class SnifsClassicPsfElement(GaussianMoffatPsfElement):
     """Model of the PSF as implemented in the pipeline.
 
     Don't use this class directly, subclass it instead with the following
@@ -241,7 +392,7 @@ class SnifsOldPsfElement(GaussianMoffatPsfElement):
     def __init__(self, exposure_time, *args, **kwargs):
         """Initialize the PSF. The PSF parameters depend on the exposure time.
         """
-        super(SnifsOldPsfElement, self).__init__(*args, **kwargs)
+        super(SnifsClassicPsfElement, self).__init__(*args, **kwargs)
 
         if exposure_time < 15:
             # Short exposure PSF
@@ -261,7 +412,7 @@ class SnifsOldPsfElement(GaussianMoffatPsfElement):
             self.eta1 = 0.00
 
     def _setup_parameters(self):
-        super(SnifsOldPsfElement, self)._setup_parameters()
+        super(SnifsClassicPsfElement, self)._setup_parameters()
         self._modify_parameter('sigma', derived=True)
         self._modify_parameter('beta', derived=True)
         self._modify_parameter('eta', derived=True)
@@ -276,14 +427,14 @@ class SnifsOldPsfElement(GaussianMoffatPsfElement):
         p['eta'] = self.eta0 + self.eta1 * p['alpha']
 
         # Update parameters from the superclass
-        parent_parameters = super(SnifsOldPsfElement, self).\
+        parent_parameters = super(SnifsClassicPsfElement, self).\
             _calculate_derived_parameters(p)
 
         return parent_parameters
 
 
-class ChromaticSnifsOldPsfElement(SnifsOldPsfElement):
-    """A chromatic SnifsOldPsfElement with seeing dependence on wavelength.
+class ChromaticSnifsClassicPsfElement(SnifsClassicPsfElement):
+    """A chromatic SnifsClassicPsfElement with seeing dependence on wavelength.
 
     The PSF alpha parameter takes the following form:
 
@@ -299,10 +450,10 @@ class ChromaticSnifsOldPsfElement(SnifsOldPsfElement):
         """Initialize the PSF."""
         self.alpha_degree = alpha_degree
 
-        super(ChromaticSnifsOldPsfElement, self).__init__(*args, **kwargs)
+        super(ChromaticSnifsClassicPsfElement, self).__init__(*args, **kwargs)
 
     def _setup_parameters(self):
-        super(ChromaticSnifsOldPsfElement, self)._setup_parameters()
+        super(ChromaticSnifsClassicPsfElement, self)._setup_parameters()
 
         # Alpha is now a derived parameter
         self._modify_parameter('alpha', derived=True)
@@ -334,13 +485,13 @@ class ChromaticSnifsOldPsfElement(SnifsOldPsfElement):
 
         # Calculate the alpha parameters as a function of wavelength.
         x = wavelength / config.reference_wavelength
-        alpha = alpha_params[-1] * x**(np.polyval(alpha_params[:-1], x-1))
+        alpha = evaluate_power_law(alpha_params, x)
 
         # Add in the new parameters
         p['alpha'] = alpha
 
         # Update parameters from the superclass
-        parent_parameters = super(ChromaticSnifsOldPsfElement, self).\
+        parent_parameters = super(ChromaticSnifsClassicPsfElement, self).\
             _calculate_derived_parameters(p)
 
         return parent_parameters
@@ -489,14 +640,12 @@ class SnifsFourierSceneModel(SceneModel):
     a function of wavelength and a power law is used to determine the seeing
     variation with wavelength.
 
-    The background degree specifies which background model to use. If
-    background_degree is an integer greater than zero, then a polynomial
-    background of that order is used. If background_degree is 0, a flat
-    background is used. If background_degree is -1, no background is used.
+    The background degree specifies which background model to use. See
+    get_background_element for details.
     """
     def __init__(self, image=None, variance=None,
                  use_empirical_parameters=True, wavelength_dependence=False,
-                 adr_model=None, background_degree=0, spaxel_size=None,
+                 background_degree=0, adr_model=None, spaxel_size=None,
                  pressure=None, temperature=None, **kwargs):
         """Build the elements of the PSF model.
 
@@ -564,21 +713,7 @@ class SnifsFourierSceneModel(SceneModel):
         # Background. The background is a slowly varying function, and doesn't
         # need to be convolved with the PSF or with the pixel. We apply it
         # after pixelization.
-        if background_degree == 0:
-            # Flat background
-            background_element = Background()
-        elif background_degree > 0:
-            # Polynomial background
-            background_element = PolynomialBackground(
-                background_degree=background_degree
-            )
-        elif background_element == -1:
-            # No background
-            background_element = None
-        else:
-            raise SceneModelException("Unknown background_degree %d!" %
-                                      background_degree)
-
+        background_element = get_background_element(background_degree)
         if background_element is not None:
             elements.append(background_element)
 
@@ -656,7 +791,7 @@ class SnifsFourierSceneModel(SceneModel):
         return scene_model
 
 
-class SnifsOldSceneModel(SceneModel):
+class SnifsClassicSceneModel(SceneModel):
     """A scene model for the SNIFS IFU using a Gaussian + Moffat PSF.
 
     This implements the original PSF model for SNIFS which is the sum of a
@@ -675,16 +810,20 @@ class SnifsOldSceneModel(SceneModel):
 
     To get behavior that matches what is currently in the pipeline, the
     subsampling needs to match (=3 by default in the pipeline).
+
+    The background degree specifies which background model to use. See
+    get_background_element for details.
     """
     def __init__(self, image=None, variance=None, exposure_time=None,
-                 alpha_degree=2, wavelength_dependence=False, adr_model=None,
-                 spaxel_size=None, pressure=None, temperature=None, **kwargs):
+                 alpha_degree=2, wavelength_dependence=False,
+                 background_degree=0, adr_model=None, spaxel_size=None,
+                 pressure=None, temperature=None, **kwargs):
         """Build the elements of the PSF model."""
         elements = []
 
         if exposure_time is None:
             raise SceneModelException(
-                "Must specify exposure time for SnifsOldSceneModel"
+                "Must specify exposure time for SnifsClassicSceneModel"
             )
 
         # Point source for the supernova
@@ -693,10 +832,10 @@ class SnifsOldSceneModel(SceneModel):
 
         # Gaussian + Moffat PSF.
         if wavelength_dependence:
-            psf_element = ChromaticSnifsOldPsfElement(alpha_degree,
-                                                      exposure_time)
+            psf_element = ChromaticSnifsClassicPsfElement(alpha_degree,
+                                                          exposure_time)
         else:
-            psf_element = SnifsOldPsfElement(exposure_time)
+            psf_element = SnifsClassicPsfElement(exposure_time)
         elements.append(psf_element)
 
         # ADR
@@ -718,18 +857,580 @@ class SnifsOldSceneModel(SceneModel):
         # Background. The background is a slowly varying function, and doesn't
         # need to be convolved with the PSF or with the pixel. We apply it
         # after pixelization.
-        background_element = Background()
-        elements.append(background_element)
+        background_element = get_background_element(background_degree)
+        if background_element is not None:
+            elements.append(background_element)
 
         if wavelength_dependence:
             shared_parameters = ['wavelength']
         else:
             shared_parameters = []
 
-        super(SnifsOldSceneModel, self).__init__(
+        super(SnifsClassicSceneModel, self).__init__(
             elements=elements,
             image=image,
             variance=variance,
             shared_parameters=shared_parameters,
             **kwargs
         )
+
+
+class SnifsCubeFitter(object):
+    """Fitter to fit a SNIFS cube.
+
+    The fit happens in several parts:
+    - Split the cube into several metaslices.
+    - Fit a Gaussian to each metaslice to determine the initial position.
+    - Fit the PSF to each metaslice to determine the initial PSF parameters.
+    - Estimate global parameters for the PSF.
+    - Fit a full chromatic model to the metaslices.
+    - Extract the cube using the full chromatic model.
+    """
+    def __init__(self, path, psf="fourier", background_degree=0,
+                 subsampling=config.default_subsampling,
+                 border=config.default_border, least_squares=False,
+                 verbosity=0, **kwargs):
+        """Initialize the fitter.
+
+        path is the path to the fits cube that will be extracted.
+        """
+        self.verbosity = verbosity
+
+        self._read_cube(path)
+        self._setup_psf(psf, **kwargs)
+
+        self.background_degree = background_degree
+        self.subsampling = subsampling
+        self.border = border
+        self.least_squares = least_squares
+
+        # Meta cube variables. These are set in fit_metaslices_2d
+        self.meta_cube = None
+        self.metaslice_info = None
+        self.metaslice_guesses = None
+
+        # 3D fit results
+        self.fitter_3d = None
+        self.fit_scene_model = None
+        self.meta_cube_model = None
+        self.reference_seeing = None
+
+        # Extraction
+        self.extraction = None
+
+        if least_squares:
+            raise SceneModelException("Least-squares is not implemented!")
+
+        self.print_cube_info()
+
+    def print_message(self, message, minimum_verbosity=0):
+        """Print message if verbosity level >= minimum_verbosity."""
+        if self.verbosity >= minimum_verbosity:
+            print(message)
+
+    def _read_cube(self, path):
+        """Read a SNIFS cube that is stored in a fits file.
+
+        The cube can be either in Euro3D or Fits3D format. We detect the format
+        and handle either transparently here.
+        """
+        # Load the cube
+        self.print_message("Opening datacube %s" % path)
+        try:
+            try:
+                # Check what kind of cube we have. pySNIFS raises a ValueError
+                # if the cube is a Fits3d file that we tried to load as Euro3D.
+                header = fits.getheader(path, 1)
+                cube = pySNIFS.SNIFS_cube(e3d_file=path)
+            except ValueError:
+                # We have a 3D fits cube
+                header = fits.getheader(path, 0)  # Primary extension
+                cube = pySNIFS.SNIFS_cube(fits3d_file=path)
+        except IOError:
+            raise SceneModelException("Cannot access file '%s'" % path)
+
+        # Update the parallactic angle in the header if it isn't there already
+        if 'PARANG' not in header:
+            print("WARNING: Computing PARANG from header ALTITUDE, AZIMUTH "
+                  "and LATITUDE.")
+            _, header['PARANG'] = estimate_zenithal_parallactic(header)
+
+        # Make sure that the pressure and temperature in the header are valid,
+        # and update them if necessary.
+        pressure, temperature = read_pressure_and_temperature(header)
+
+        # Only B and R channel extractions are implemented. Make sure that we
+        # are on one of these.
+        channel = header['CHANNEL'][0].upper()  # 'B' or 'R'
+        if channel not in ('B', 'R'):
+            raise SceneModelException(
+                "Input datacube %s has no valid CHANNEL keyword (%s)" %
+                (path, header['CHANNEL'])
+            )
+
+        # Set up an ADR model
+        adr_model = build_adr_model_from_header(header)
+
+        # Save the results
+        self.path = path
+        self.header = header
+        self.cube = cube
+
+        self.channel = channel
+        self.adr_model = adr_model
+
+    def _setup_psf(self, psf, **kwargs):
+        """Set up a PSF to be fit. All PSF specific configuration should happen
+        here.
+        """
+        scene_model_kwargs = {}
+
+        if psf == "fourier":
+            scene_model_class = SnifsFourierSceneModel
+            seeing_degree = 1
+            seeing_key = 'seeing_width'
+            seeing_powerlaw_keys = ['seeing_ref_power', 'seeing_ref_width']
+            global_fit_keys = ['ell_coord_x', 'ell_coord_y']
+        elif psf == "classic":
+            scene_model_class = SnifsClassicSceneModel
+            seeing_degree = 2
+            seeing_key = 'alpha'
+            seeing_powerlaw_keys = ['A%d' % i for i in
+                                    range(seeing_degree + 1)]
+            global_fit_keys = ['ell', 'xy']
+
+            scene_model_kwargs['exposure_time'] = self.header['EFFTIME']
+            scene_model_kwargs['alpha_degree'] = seeing_degree
+        else:
+            raise SceneModelException("Unknown PSF %s!" % psf)
+
+        self.psf = psf
+        self.scene_model_class = scene_model_class
+        self.seeing_degree = seeing_degree
+        self.seeing_key = seeing_key
+        self.seeing_powerlaw_keys = seeing_powerlaw_keys
+        self.global_fit_keys = global_fit_keys
+        self.scene_model_kwargs = scene_model_kwargs
+
+    def print_cube_info(self):
+        """Print information about the cube and the model that will be fit to
+        it
+        """
+        cube = self.cube
+        header = self.header
+
+        self.print_message("Cube %s [%s]: [%.2f-%.2f], %d spaxels" %
+                           (os.path.basename(self.path),
+                            'E3D' if cube.from_e3d_file else '3D',
+                            cube.lbda[0], cube.lbda[-1], cube.nlens), 1)
+
+        self.print_message("  Object: %s, Efftime: %.1fs, Airmass: %.2f" %
+                           (header.get('OBJECT', 'Unknown'), header['EFFTIME'],
+                            header['AIRMASS']))
+
+        self.print_message("  PSF: %s, subsampling: %d, border: %d" %
+                           (self.psf, self.subsampling, self.border))
+
+        if self.background_degree > 0:
+            self.print_message("  Sky: polynomial, degree %d" %
+                               self.background_degree)
+        elif self.background_degree == 0:
+            self.print_message("  Sky: uniform")
+        elif self.background_degree == -1:
+            self.print_message("  Sky: none")
+        else:
+            raise SceneModelException("Invalid sky degree '%d'" %
+                                      self.background_degree)
+
+        self.print_message("  Channel: '%s'" % self.channel)
+        self.print_message("  Fit method: %s" % ('chi2' if self.least_squares
+                                                 else 'least-squares'))
+
+        # Initial ADR model
+        self.print_message(
+            "  ADR guess: delta=%.2f (airmass=%.2f), theta=%.1f deg" % (
+                self.adr_model.delta, self.adr_model.get_airmass(),
+                self.adr_model.theta * rad_to_deg
+            ), 1)
+
+    def fit_metaslices_2d(self, num_meta_slices=12):
+        """Fit the meta slices.
+
+        This step produces initial guesses for the parameters of the 3D fit.
+        """
+        self.print_message("Meta-slice 2D-fitting...")
+
+        # Create the metaslices
+        slices = metaslice(self.cube.nslice, num_meta_slices, trim=10)
+        if self.cube.from_e3d_file:
+            meta_cube = pySNIFS.SNIFS_cube(e3d_file=self.path, slices=slices)
+        else:
+            meta_cube = pySNIFS.SNIFS_cube(fits3d_file=self.path,
+                                           slices=slices)
+        meta_cube_data, meta_cube_var = cube_to_arrays(meta_cube)
+
+        self.print_message(
+            "  Meta-slices before selection: %d from %.2f to %.2f by %.2f A" %
+            (num_meta_slices, meta_cube.lstart, meta_cube.lend,
+             meta_cube.lstep)
+        )
+
+        # Fit positions with Gaussian psf models, and then fit the full PSF to
+        # each image individually.
+        valid = []
+        gaussian_scene_models = []
+        individual_scene_models = []
+        individual_uncertainties = []
+
+        for idx in range(len(meta_cube_data)):
+            try:
+                # Crude Gaussian fit for initial position.
+                gaussian_model = GaussianSceneModel(
+                    meta_cube_data[idx], meta_cube_var[idx], subsampling=1,
+                    border=0
+                )
+                gaussian_model.fix(rho=0.)
+                gaussian_model.fit()
+
+                initial_position_x = gaussian_model['center_x']
+                initial_position_y = gaussian_model['center_y']
+
+                # Fit the full PSF model to each image individually, starting
+                # at the Gaussian fit location.
+                full_model = self.scene_model_class(
+                    image=meta_cube_data[idx],
+                    variance=meta_cube_var[idx],
+                    wavelength_dependence=False,
+                    background_degree=self.background_degree,
+                    subsampling=self.subsampling,
+                    border=self.border,
+                    **self.scene_model_kwargs
+                )
+                full_model.set_parameters(
+                    center_x=initial_position_x,
+                    center_y=initial_position_y,
+                )
+
+                full_model.fit()
+
+                uncertainties = full_model.calculate_uncertainties()
+
+                if self.verbosity >= 2:
+                    print("")
+                    full_model.print_fit_info("Fit to metaslice %d" % idx,
+                                              uncertainties=uncertainties)
+                    print("")
+
+                gaussian_scene_models.append(gaussian_model)
+                individual_scene_models.append(full_model)
+                individual_uncertainties.append(uncertainties)
+                valid.append(True)
+            except SceneModelException as e:
+                print("    Fit on slice %d failed with error %s" % (idx, e))
+                gaussian_scene_models.append(None)
+                individual_scene_models.append(None)
+                individual_uncertainties.append(None)
+                valid.append(False)
+                raise
+
+        valid = np.array(valid)
+        if not np.all(valid):
+            print("  WARNING: %d metaslices discarded due to invalid fits" %
+                  np.sum(~valid))
+
+        # Guess the reference positions for the ADR using the individual fits.
+        x_centers = extract_key(individual_scene_models, 'center_x')
+        y_centers = extract_key(individual_scene_models, 'center_y')
+
+        x_center_errs = extract_key(individual_uncertainties, 'center_x')
+        y_center_errs = extract_key(individual_uncertainties, 'center_y')
+
+        # Back-propagate positions to the reference wavelength, and take the
+        # median value.
+        valid_xrefs, valid_yrefs = self.adr_model.refract(
+            x_centers[valid], y_centers[valid], meta_cube.lbda[valid],
+            backward=True, unit=self.cube.spxSize
+        )
+        xrefs = np.empty(num_meta_slices)
+        yrefs = np.empty(num_meta_slices)
+        xrefs.fill(np.nan)
+        yrefs.fill(np.nan)
+        xrefs[valid] = valid_xrefs
+        yrefs[valid] = valid_yrefs
+
+        xref = np.median(valid_xrefs)
+        yref = np.median(valid_yrefs)
+
+        # Cut out any images that didn't find PSFs at the right position.
+        r = np.hypot(valid_xrefs - xref, valid_yrefs - yref)
+        rmax = 3 * nmad(r)
+        good = np.zeros(num_meta_slices, dtype=bool)
+        good[valid] = (r <= rmax)           # Valid fit and reasonable position
+        bad = np.zeros(num_meta_slices, dtype=bool)
+        bad[valid] = (r > rmax)             # Valid fit but discarded position
+        if bad.any():
+            print("  WARNING: %d metaslices discarded after ADR selection" %
+                  (len(np.nonzero(bad))))
+
+        # Estimate the seeing coefficients
+        seeing_widths = extract_key(individual_scene_models, self.seeing_key)
+        seeing_uncertainties = extract_key(individual_uncertainties,
+                                           self.seeing_key)
+        seeing_powerlaw_guesses = fit_power_law(
+            meta_cube.lbda[good] / config.reference_wavelength,
+            seeing_widths[good],
+            self.seeing_degree
+        )
+        guess_seeing_widths = evaluate_power_law(
+            seeing_powerlaw_guesses,
+            meta_cube.lbda / config.reference_wavelength
+        )
+
+        # Estimate the positions. Here we used a clipped mean rather than a
+        # median, following what extract_star did.
+        if good.any():
+            self.print_message("  %d/%d centroids found within %.2f spx of "
+                               "(%.2f,%.2f)" % (len(xrefs[good]), len(xrefs),
+                                                rmax, xref, yref), 1)
+            ref_center_x_guess = xrefs[good].mean()
+            ref_center_y_guess = yrefs[good].mean()
+        else:
+            raise ValueError('No position initial guess')
+
+        # Build a table of the information for each slice.
+        metaslice_info = Table({
+            'wavelength': meta_cube.lbda,
+            'center_x': x_centers,
+            'center_y': y_centers,
+            'center_x_uncertainty': x_center_errs,
+            'center_y_uncertainty': y_center_errs,
+            self.seeing_key: seeing_widths,
+            '%s_uncertainty' % self.seeing_key: seeing_uncertainties,
+            'guess_seeing_widths': guess_seeing_widths,
+            'valid': valid,
+            'good': good,
+            'bad': bad,
+            'gaussian_scene_model': gaussian_scene_models,
+            'scene_model': individual_scene_models,
+            'uncertainties': individual_uncertainties,
+        })
+
+        # Save guess information
+        metaslice_guesses = {
+            'ref_center_x': ref_center_x_guess,
+            'ref_center_y': ref_center_y_guess,
+            'adr_delta': self.adr_model.delta,
+            'adr_theta': self.adr_model.theta,
+        }
+        for key, value in zip(self.seeing_powerlaw_keys,
+                              seeing_powerlaw_guesses):
+            metaslice_guesses[key] = value
+
+        # Save results
+        self.meta_cube = meta_cube
+        self.metaslice_info = metaslice_info
+        self.metaslice_guesses = metaslice_guesses
+
+    def fit_metaslices_3d(self):
+        self.print_message("Meta-slice 3D-fitting...")
+
+        # Make sure that the meta cube has already been created. This is done
+        # in fit_metaslices_2d which needs to be called before this function.
+        if self.meta_cube is None:
+            raise SceneModelException(
+                "Must generate metaslices before calling fit_metaslices_3d"
+            )
+
+        # Model to use for the 3d fit
+        scene_model = self.scene_model_class(
+            wavelength_dependence=True,
+            background_degree=self.background_degree,
+            subsampling=self.subsampling,
+            border=self.border,
+            adr_model=self.adr_model,
+            spaxel_size=self.cube.spxSize,
+            **self.scene_model_kwargs
+        )
+
+        meta_cube_data, meta_cube_var = cube_to_arrays(self.meta_cube)
+
+        fitter = MultipleImageFitter(
+            scene_model,
+            meta_cube_data,
+            meta_cube_var,
+        )
+        fitter.fix(wavelength=self.meta_cube.lbda)
+
+        # Set initial guesses from the metaslice fits
+        for key, value in self.metaslice_guesses.items():
+            fitter.add_global_fit_parameter(key, value)
+
+        # Do global fits for all other model parameters with default starting
+        # parameters.
+        for key in self.global_fit_keys:
+            fitter.add_global_fit_parameter(key)
+
+        fit_scene_model = fitter.fit()
+
+        # Calculate covariance matrix
+        print("Calculating covariance...")
+        try:
+            covariance_names, covariance = fitter.calculate_covariance()
+        except SceneModelException as e:
+            # Failed to calculate the covariance. This can happen for many
+            # reasons. Print out the model that we failed on to help figure out
+            # what happened.
+            fitter.print_fit_info("3D metaslice fit", uncertainties=False)
+            raise
+
+        uncertainties = fitter.calculate_uncertainties(
+            names=covariance_names, covariance=covariance
+        )
+
+        # Print out fit info
+        parameters = fitter.parameters
+
+        self.print_message(
+            "  Ref. position fit @%.0f A: %+.2f±%.2f × %+.2f±%.2f spx" %
+            (config.reference_wavelength, parameters['ref_center_x'],
+             uncertainties['ref_center_x'], parameters['ref_center_y'],
+             uncertainties['ref_center_y']), 1
+        )
+
+        # Update ADR params
+        self.print_message(
+            "  ADR fit: delta=%.2f±%.2f, theta=%.1f±%.1f deg" %
+            (parameters['adr_delta'], uncertainties['adr_delta'],
+             parameters['adr_theta'] * rad_to_deg, uncertainties['adr_theta'] *
+             rad_to_deg), 1
+        )
+
+        self.print_message("  Effective airmass: %.2f" %
+                           self.adr_model.get_airmass())
+
+        # Estimated seeing (FWHM in arcsec)
+        reference_seeing = self.cube.spxSize * fit_scene_model.calculate_fwhm(
+            wavelength=config.reference_wavelength
+        )
+        self.print_message('  Seeing estimate @%.0f A: %.2f" FWHM' %
+                           (config.reference_wavelength, reference_seeing))
+
+        # Estimated seeing parameters
+        seeing_powerlaw_values = [parameters[i] for i in
+                                  self.seeing_powerlaw_keys]
+        fit_seeing_widths = evaluate_power_law(
+            seeing_powerlaw_values,
+            self.meta_cube.lbda / config.reference_wavelength
+        )
+
+        # Print out full fit info if requested
+        if self.verbosity >= 1:
+            print("")
+            fitter.print_fit_info("3D metaslice fit",
+                                  uncertainties=uncertainties,
+                                  verbosity=self.verbosity)
+            print("")
+
+        # Create a standard SNIFS cube with the meta cube model
+        meta_cube_model = pySNIFS.SNIFS_cube(lbda=self.meta_cube.lbda)
+        model = fitter.evaluate()[:, meta_cube_model.i, meta_cube_model.j]
+        meta_cube_model.data = model
+
+        # Save results
+        self.metaslice_info['fit_seeing_widths'] = fit_seeing_widths
+        self.fitter_3d = fitter
+        self.fit_scene_model = fit_scene_model
+        self.meta_cube_model = meta_cube_model
+        self.reference_seeing = reference_seeing
+
+    def extract(self):
+        # Make sure that the 3D fit has already been done.
+        if self.fit_scene_model is None:
+            raise SceneModelException(
+                "Must run the 3D metaslice fit before extracting!"
+            )
+
+        print("Extracting the point-source spectrum...")
+
+        cube_data, cube_var = cube_to_arrays(self.cube)
+
+        extraction = self.fit_scene_model.extract(
+            cube_data, cube_var, wavelength=self.cube.lbda
+        )
+
+        # Convert (mean) sky spectrum to "per arcsec**2"
+        spaxel_size = self.cube.spxSize
+        extraction['background_density'] = \
+            extraction['background'] / spaxel_size**2
+        extraction['background_density_variance'] = \
+            extraction['background_variance'] / spaxel_size**4
+
+        self.extraction = extraction
+
+    def write_spectrum(self, output_path, sky_output_path,
+                       prefix=config.default_fits_prefix):
+        """Write the spectrum out to a fits file at the given path"""
+        # Make sure that the extraction has already been done
+        if self.extraction is None:
+            raise SceneModelException(
+                "Must run the 3D metaslice fit before extracting!"
+            )
+
+        # Build the header for the output file. We start with the input header
+        # and add in tons of new keys.
+        header = self.header
+
+        items = self.fit_scene_model.get_fits_header_items(prefix=prefix)
+        for key, value, description in items:
+            header[key] = (value, description)
+
+        # Helper to prefix things
+        def p(extension):
+            return "%s%s" % (prefix, extension)
+
+        header[p('VERS')] = config.__version__
+        header[p('CUBE')] = (self.path, "Input cube")
+        header[p('LREF')] = (config.reference_wavelength, "Lambda ref. [A]")
+        header[p('CHI2')] = (self.fitter_3d.fit_chi_square,
+                             "Chi2|RSS of 3D-fit")
+        header[p('AIRM')] = (self.adr_model.get_airmass(), "Effective airmass")
+        header[p('PARAN')] = (self.adr_model.get_parangle(),
+                              "Effective parangle [deg]")
+        header[p('LMIN')] = (self.meta_cube.lstart,
+                             "Meta-slices minimum lambda")
+        header[p('LMAX')] = (self.meta_cube.lend, "Meta-slices maximum lambda")
+
+        header[p('PSF')] = (self.psf, 'PSF model name')
+        header[p('SUB')] = (self.subsampling, 'Model subsampling')
+        header[p('BORD')] = (self.border, 'Model border')
+
+        # Total sky flux (per arcsec**2)
+        tflux = self.extraction['amplitude'].sum()
+        sflux = self.extraction['background_density'].sum()
+
+        header[p('TFLUX')] = (tflux, 'Total point-source flux')
+        header[p('SFLUX')] = (sflux, 'Total sky flux/arcsec^2')
+        header['SEEING'] = (self.reference_seeing,
+                            'Estimated seeing @lbdaRef ["] (extract_star2)')
+
+        print("TODO: add prior info to header")
+
+        # Save the point source spectrum
+        print("Saving ouptut point-source spectrum to '%s'" % output_path)
+        point_source_spectrum = pySNIFS.spectrum(
+            data=self.extraction['amplitude'],
+            var=self.extraction['amplitude_variance'],
+            start=self.cube.lbda[0],
+            step=self.cube.lstep,
+        )
+        write_pysnifs_spectrum(point_source_spectrum, output_path, header)
+
+        # Save the sky spectrum
+        print("Saving ouptut sky spectrum to '%s'" % sky_output_path)
+        sky_spectrum = pySNIFS.spectrum(
+            data=self.extraction['background_density'],
+            var=self.extraction['background_density_variance'],
+            start=self.cube.lbda[0],
+            step=self.cube.lstep,
+        )
+        write_pysnifs_spectrum(sky_spectrum, sky_output_path, header)

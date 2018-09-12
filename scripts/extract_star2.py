@@ -8,9 +8,6 @@ PSF is a exponential profile in Fourier space convolved with an instrumental
 PSF and a model of the tracking.
 """
 
-__author__ = "K. Boone, Y. Copin, C. Buton, E. Pecontal"
-__version__ = '$Id: extract_star2.py,v 1.0 2018/07/23 13:17:00 kboone Exp $'
-
 import os
 
 import pyfits as F
@@ -303,7 +300,9 @@ if __name__ == "__main__":
 
     usage = "[%prog] [options] incube.fits"
 
-    parser = optparse.OptionParser(usage, version=__version__)
+    parser = optparse.OptionParser(
+        usage, version=scene_model.config.__version__
+    )
 
     parser.add_option("-i", "--in", type=str, dest="input",
                       help="Input datacube (or use argument)")
@@ -319,8 +318,8 @@ if __name__ == "__main__":
                       default=0)
 
     # PSF model
-    parser.add_option("--psf", choices=('old', 'fourier'), help="PSF model "
-                      "(old|fourier) [%default]", default='fourier')
+    parser.add_option("--psf", choices=('classic', 'fourier'), help="PSF model"
+                      " (classic|fourier) [%default]", default='fourier')
 
     # Extraction method and parameters
     parser.add_option("-N", "--nmeta", type=int,
@@ -417,95 +416,6 @@ if __name__ == "__main__":
     if opts.seeingPrior and not opts.usePriors:
         parser.error("Seeing prior requires prior usage (--usePriors > 0).")
 
-    # Input datacube ==========================================================
-
-    print("Opening datacube %s" % opts.input)
-
-    # The pySNIFS e3d_data_header dictionary is not enough for later
-    # updates in fill_header, which requires a *true* pyfits header.
-    try:
-        try:                                    # Try to read a Euro3D cube
-            inhdr = F.getheader(opts.input, 1)  # 1st extension
-            full_cube = pySNIFS.SNIFS_cube(e3d_file=opts.input)
-            isE3D = True
-        except ValueError:                      # Try to read a 3D FITS cube
-            inhdr = F.getheader(opts.input, 0)  # Primary extension
-            full_cube = pySNIFS.SNIFS_cube(fits3d_file=opts.input)
-            isE3D = False
-    except IOError:
-        parser.error("Cannot access file '%s'" % opts.input)
-    step = full_cube.lstep
-
-    print_msg("Cube %s [%s]: %d slices [%.2f-%.2f], %d spaxels" %
-              (os.path.basename(opts.input), 'E3D' if isE3D else '3D',
-               full_cube.nslice,
-               full_cube.lbda[0], full_cube.lbda[-1], full_cube.nlens), 1)
-
-    objname = inhdr.get('OBJECT', 'Unknown')
-    efftime = inhdr['EFFTIME']            # [s]
-    airmass = inhdr['AIRMASS']
-    try:
-        parangle = inhdr['PARANG']        # Sky parallactic angle [deg]
-    except KeyError:                      # Not in original headers
-        print("WARNING: Computing PARANG from header ALTITUDE, AZIMUTH and "
-              "LATITUDE.")
-        # [deg]
-        _, inhdr['PARANG'] = snifs_scene.estimate_zenithal_parallactic(inhdr)
-
-    channel = inhdr['CHANNEL'][0].upper()  # 'B' or 'R'
-    # Include validity tests and defaults
-    pressure, temp = snifs_scene.read_pressure_and_temperature(inhdr)
-
-    background_degree = opts.skyDeg
-    hasSky = background_degree != -1       # Sky component
-
-    # Test channel and set default output name
-    if channel not in ('B', 'R'):
-        parser.error(
-            "Input datacube %s has no valid CHANNEL keyword (%s)" %
-            (opts.input, channel))
-    if not opts.out:                    # Default output
-        opts.out = 'spec_%s.fits' % (channel)
-
-    # Select the PSF
-    scene_model_parameters = {
-        'subsampling': opts.subsampling,
-        'border': opts.border,
-    }
-    if opts.psf == 'old':
-        scene_model_class = snifs_scene.SnifsOldSceneModel
-        seeing_degree = 2
-        scene_model_parameters['exposure_time'] = efftime
-        scene_model_parameters['alpha_degree'] = seeing_degree
-        seeing_key = 'alpha'
-        seeing_powerlaw_keys = ['A%d' % i for i in range(seeing_degree + 1)]
-        global_fit_keys = ['ell', 'xy']
-    elif opts.psf == 'fourier':
-        scene_model_class = snifs_scene.SnifsFourierSceneModel
-        scene_model_parameters['background_degree'] = background_degree
-        seeing_degree = 1
-        seeing_key = 'seeing_width'
-        seeing_powerlaw_keys = ['seeing_ref_power', 'seeing_ref_width']
-        global_fit_keys = ['ell_coord_x', 'ell_coord_y']
-    else:
-        parser.error("Invalid PSF model '%s'" % opts.psf)
-
-    print("  Object: %s, Efftime: %.1fs, Airmass: %.2f" %
-          (objname, efftime, airmass))
-    print("TODO: print PSF info")
-
-    # print("  PSF: '%s', sub-sampled x%d" % \
-    # (', '.join((psfFn.model, psfFn.name)), psfFn.subsampling))
-
-    if background_degree > 0:
-        print("  Sky: polynomial, degree %d" % background_degree)
-    elif background_degree == 0:
-        print("  Sky: uniform")
-    elif background_degree == -1:
-        print("  Sky: none")
-    else:
-        parser.error("Invalid sky degree '%d'" % background_degree)
-
     # Accounting
     if opts.accountant:
         try:
@@ -521,345 +431,56 @@ if __name__ == "__main__":
     else:
         accountant = None
 
-    # 2D-model fitting ========================================================
+    # Load the data cube into the fitter.
+    try:
+        fitter = snifs_scene.SnifsCubeFitter(
+            opts.input,
+            psf=opts.psf,
+            background_degree=opts.skyDeg,
+            subsampling=opts.subsampling,
+            border=opts.border,
+            verbosity=opts.verbosity
+        )
+    except scene_model.SceneModelException as e:
+        parser.error(e.message)
 
-    # Meta-slice definition (min,max,step [px]) ------------------------------
+    # If the output paths weren't specified, build defaults.
+    if not opts.out:
+        opts.out = 'spec_%s.fits' % (fitter.channel)
+    if not opts.sky:
+        opts.sky = 'sky_%s.fits' % (fitter.channel)
 
-    slices = metaslice(full_cube.nslice, opts.nmeta, trim=10)
-    print("  Channel: '%s', extracting slices: %s" % (channel, slices))
+    # Do the 2D fit
+    fitter.fit_metaslices_2d(num_meta_slices=opts.nmeta)
 
-    if isE3D:
-        meta_cube = pySNIFS.SNIFS_cube(e3d_file=opts.input, slices=slices)
-    else:
-        meta_cube = pySNIFS.SNIFS_cube(fits3d_file=opts.input, slices=slices)
-    meta_cube.flag_nans(name='meta-cube')
-    meta_cube.x = meta_cube.i - 7       # From I,J to spx coords
-    meta_cube.y = meta_cube.j - 7
-    spxSize = meta_cube.spxSize
-    nmeta = meta_cube.nslice
+    # Do the 3D fit
+    fitter.fit_metaslices_3d()
 
-    print_msg("  Meta-slices before selection: %d from %.2f to %.2f by %.2f A"
-              % (nmeta, meta_cube.lstart, meta_cube.lend, meta_cube.lstep), 0)
-
-    if opts.keepmodel:                  # Store meta-slices in 3D-cube
+    # Save the meta-slice model if desired.
+    if opts.keepmodel:
         path, name = os.path.split(opts.out)
-        outpsf = os.path.join(path, 'meta_' + name)
-        print("Saving meta-slices in 3D-fits cube '%s'..." % outpsf)
-        meta_cube.WR_3d_fits(outpsf)
 
-    # Initial ADR model
-    adr = snifs_scene.build_adr_model_from_header(inhdr)
-    print_msg('  ' + str(adr), 1)
+        meta_path = os.path.join(path, 'meta_' + name)
+        print("  Saving meta-slices in 3D-fits cube '%s'..." % meta_path)
+        fitter.meta_cube.WR_3d_fits(meta_path)
 
-    # 2D-fit ------------------------------
-
-    print("Meta-slice 2D-fitting (%s)..." %
-          ('chi2' if opts.chi2fit else 'least-squares'))
-
-    meta_cube_data = np.zeros((meta_cube.data.shape[0], 15, 15))
-    meta_cube_var = np.zeros(meta_cube_data.shape)
-    meta_cube_var[...] = np.nan
-
-    meta_cube_data[:, meta_cube.i, meta_cube.j] = meta_cube.data
-    meta_cube_var[:, meta_cube.i, meta_cube.j] = meta_cube.var
-
-    # Fit positions with Gaussian psf models, and then fit the full PSF to each
-    # image individually.
-    valid = []
-    gaussian_psf_models = []
-    individual_psf_models = []
-    individual_uncertainties = []
-
-    for idx in range(len(meta_cube_data)):
-        try:
-            # Gaussian fit for initial position.
-            gaussian_model = scene_model.GaussianSceneModel(
-                meta_cube_data[idx], meta_cube_var[idx], subsampling=1,
-                border=0
-            )
-            gaussian_model.fix(rho=0.)
-            gaussian_model.fit()
-
-            initial_position_x = gaussian_model['center_x']
-            initial_position_y = gaussian_model['center_y']
-
-            # Fit the full PSF model to each image individually, starting at
-            # the Gaussian fit location.
-            full_psf_model = scene_model_class(
-                meta_cube_data[idx], meta_cube_var[idx],
-                **scene_model_parameters
-            )
-            full_psf_model.set_parameters(
-                center_x=initial_position_x,
-                center_y=initial_position_y,
-            )
-
-            full_psf_model.fit()
-
-            uncertainties = full_psf_model.calculate_uncertainties()
-
-            if opts.verbosity >= 2:
-                print("")
-                full_psf_model.print_fit_info("Fit to metaslice %d" % idx,
-                                              uncertainties=uncertainties)
-                print("")
-
-            gaussian_psf_models.append(gaussian_model)
-            individual_psf_models.append(full_psf_model)
-            individual_uncertainties.append(uncertainties)
-            valid.append(True)
-        except scene_model.PsfModelException as e:
-            print("Fit on slice %d failed with error %s" % (idx, e))
-            gaussian_psf_models.append(None)
-            individual_psf_models.append(None)
-            individual_uncertainties.append(None)
-            valid.append(False)
-            raise
-
-    valid = np.array(valid)
-    if not np.all(valid):
-        print("WARNING: %d metaslices discarded due to invalid fits" % \
-            np.sum(~valid))
-
-    # Guess the reference positions for the ADR using the individual fits.
-    xc_vec = extract_key(individual_psf_models, 'center_x')
-    yc_vec = extract_key(individual_psf_models, 'center_y')
-
-    xc_err = extract_key(individual_uncertainties, 'center_x')
-    yc_err = extract_key(individual_uncertainties, 'center_y')
-
-    # Back-propagate positions to lmid wavelength, and take the median value.
-    valid_xmids, valid_ymids = adr.refract(
-        xc_vec[valid], yc_vec[valid], meta_cube.lbda[valid], backward=True,
-        unit=spxSize
-    )
-    xmids = np.empty(nmeta)
-    ymids = np.empty(nmeta)
-    xmids.fill(np.nan)
-    ymids.fill(np.nan)
-    xmids[valid] = valid_xmids
-    ymids[valid] = valid_ymids
-
-    xmid = np.median(valid_xmids)
-    ymid = np.median(valid_ymids)
-
-    # Cut out any images that didn't find PSFs at the right position.
-    r = np.hypot(valid_xmids - xmid, valid_ymids - ymid)
-    rmax = 4.4478 * np.median(r)     # Robust to outliers 3*1.4826
-    good = np.zeros(nmeta, dtype=bool)
-    good[valid] = (r <= rmax)           # Valid fit and reasonable position
-    bad = np.zeros(nmeta, dtype=bool)
-    bad[valid] = (r > rmax)             # Valid fit but discarded position
-    if bad.any():
-        print("WARNING: %d metaslices discarded after ADR selection" % \
-              (len(np.nonzero(bad))))
-
-    # Estimate the seeing coefficients
-    individual_seeing_widths = extract_key(individual_psf_models, seeing_key)
-    individual_seeing_errs = extract_key(individual_uncertainties, seeing_key)
-    seeing_powerlaw_guesses = libES.powerLawFit(
-        meta_cube.lbda[good] / reference_wavelength,
-        individual_seeing_widths[good],
-        seeing_degree
-    )
-
-    # Estimate the positions. Here we used a clipped mean rather than a median,
-    # following what extract_star did.
-    if good.any():
-        print_msg("%d/%d centroids found within %.2f spx of (%.2f,%.2f)" %
-                  (len(xmids[good]), len(xmids), rmax, xmid, ymid), 1)
-        xc, yc = xmids[good].mean(), ymids[good].mean()  # Position at lmid
-    else:
-        raise ValueError('No position initial guess')
-
-    print("3D fit...")
-    fitter = scene_model.MultipleImageFitter(
-        scene_model_class(wavelength_dependence=True, adr_model=adr,
-                          spaxel_size=spxSize, **scene_model_parameters),
-        meta_cube_data, meta_cube_var,
-    )
-    fitter.fix(wavelength=meta_cube.lbda)
-
-    # Set initial guesses for the seeing
-    for key, value in zip(seeing_powerlaw_keys, seeing_powerlaw_guesses):
-        fitter.add_global_fit_parameter(key, value)
-    guess_widths = libES.powerLawEval(
-        seeing_powerlaw_guesses, meta_cube.lbda / reference_wavelength
-    )
-
-    # Do global fits for all other PSF parameters
-    for key in global_fit_keys:
-        fitter.add_global_fit_parameter(key)
-
-    # ADR parameters
-    delta0 = adr.delta           # ADR power = tan(zenithal distance)
-    theta0 = adr.theta           # ADR angle = parallactic angle [rad]
-    print_msg("  ADR guess: delta=%.2f (airmass=%.2f), theta=%.1f deg" %
-              (delta0, adr.get_airmass(), theta0 * TA.RAD2DEG), 1)
-
-    fitter.add_global_fit_parameter('ref_center_x', xc)
-    fitter.add_global_fit_parameter('ref_center_y', yc)
-
-    fitter.add_global_fit_parameter('adr_delta', delta0)
-    fitter.add_global_fit_parameter('adr_theta', theta0)
-
-    # Set up the ADR model
-    # fitter.setup_adr(pressure, temp, spxSize)
-    # fitter.add_adr_prior(channel, airmass, parangle)
-
-    fit_psf = fitter.fit()
-
-    # Calculate covariance matrix
-    print("Calculating covariance...")
-    covariance_names, covariance = fitter.calculate_covariance()
-    uncertainties = fitter.calculate_uncertainties(
-        names=covariance_names, covariance=covariance
-    )
-
-    # Print out fit facts
-    if opts.verbosity >= 1:
-        print("")
-        fitter.print_fit_info("3D metaslice fit", uncertainties=uncertainties,
-                              verbosity=opts.verbosity)
-        print("")
-
-    # Store guess and fit parameters ------------------------------
-
-    fitpar = fitter.parameters
-    chi2 = fitter.fit_chi_square
-    dof = fitter.degrees_of_freedom
-
-    print_msg("  Fit result: chi2/dof=%.2f/%d" % (chi2, dof), 1)
-    for key, value in fitter.parameters.items():
-        print_msg("  Fit result [%20s]: %s" % (key, value), 2)
-
-    print_msg("  Ref. position fit @%.0f A: %+.2f±%.2f × %+.2f±%.2f spx" %
-              (lmid, fitpar['ref_center_x'], uncertainties['ref_center_x'],
-               fitpar['ref_center_y'], uncertainties['ref_center_y']), 1)
-
-    # Update ADR params
-    print_msg("  ADR fit: delta=%.2f±%.2f, theta=%.1f±%.1f deg" %
-              (fitpar['adr_delta'], uncertainties['adr_delta'],
-               fitpar['adr_theta'] * TA.RAD2DEG, uncertainties['adr_theta'] *
-               TA.RAD2DEG), 1)
-    adr.set_param(delta=fitpar['adr_delta'], theta=fitpar['adr_theta'])
-    print("  Effective airmass: %.2f" % adr.get_airmass())
-
-    # Estimated seeing (FWHM in arcsec)
-    seeing = spxSize * fit_psf.calculate_fwhm(wavelength=reference_wavelength)
-    print('  Seeing estimate @%.0f A: %.2f" FWHM' % (reference_wavelength,
-                                                     seeing))
-
-    # Estimated seeing parameters
-    seeing_powerlaw_values = [fit_psf[i] for i in seeing_powerlaw_keys]
-    fit_widths = libES.powerLawEval(
-        seeing_powerlaw_values, meta_cube.lbda / reference_wavelength
-    )
-
-    # Check fit pertinence ------------------------------
+        model_path = os.path.join(path, 'psf_' + name)
+        print("  Saving adjusted meta-slice model in 3D-fits cube '%s'..." %
+              model_path)
+        fitter.meta_cube_model.WR_3d_fits(model_path, header=[])
 
     print("TODO: priors and checks of final values!")
 
-    # Compute point-source and background spectra =============================
-    if opts.method == 'psf':
-        radius = None
-        method = 'psf, %s' % ('chi2' if opts.chi2fit else 'least-squares')
-    else:
-        # Compute aperture radius
-        if opts.radius < 0:     # Aperture radius [sigma]
-            radius = -opts.radius * seeing / 2.355  # [arcsec]
-            method = '%s r=%.1f sigma=%.2f"' % \
-                     (opts.method, -opts.radius, radius)
-        else:                   # Aperture radius [arcsec]
-            radius = opts.radius        # [arcsec]
-            method = '%s r=%.2f"' % (opts.method, radius)
-        raise Exception("Aperture photometry not implemented!")
+    # Extract the point source spectrum
+    fitter.extract()
 
-    print("Extracting the point-source spectrum (method=%s)..." % method)
-    if not hasSky:
-        print("WARNING: No background adjusted.")
-
-    # Extraction
-    full_cube_data = np.zeros((full_cube.data.shape[0], 15, 15))
-    full_cube_var = np.zeros(full_cube_data.shape)
-    full_cube_var[...] = np.nan
-
-    full_cube_data[:, full_cube.i, full_cube.j] = full_cube.data
-    full_cube_var[:, full_cube.i, full_cube.j] = full_cube.var
-
-    extraction = fit_psf.extract(full_cube_data, full_cube_var,
-                                 wavelength=full_cube.lbda)
-
-    # Convert (mean) sky spectrum to "per arcsec**2"
-    extraction['background_density'] = extraction['background'] / spxSize**2
-    extraction['background_density_variance'] = \
-        extraction['background_variance'] / spxSize**4
-
-    # Full covariance matrix of point-source spectrum
-    print("TODO: compute point-source spectrum covariance.")
-
-    # Creating a standard SNIFS cube with the adjusted data
-    cube_fit = pySNIFS.SNIFS_cube(lbda=meta_cube.lbda)  # Always 225 spx
-    cube_fit.x = cube_fit.i - 7                        # x in spaxel
-    cube_fit.y = cube_fit.j - 7                        # y in spaxel
-
-    psf = fitter.evaluate()[:, cube_fit.i, cube_fit.j]
-    bkg = np.array([np.ones(cube_fit.i.shape) * i['background'] for i in
-                   fitter.scene_models])
-
-    cube_fit.data = psf
-
-    # Update header ------------------------------
-
-    # Total point-source flux
-    tflux = extraction['amplitude'].sum()
-    # Total sky flux (per arcsec**2)
-    sflux = extraction['background_density'].sum()
-
-    fill_header(inhdr, fit_psf, adr, meta_cube, opts, chi2, seeing, None,
-                (tflux, sflux))
-
-    # Save point-source spectrum ------------------------------
-
-    print("Saving output point-source spectrum to '%s'" % opts.out)
-
-    # Store variance as extension to signal
-    star_spec = pySNIFS.spectrum(data=extraction['amplitude'],
-                                 var=extraction['amplitude_variance'],
-                                 start=full_cube.lbda[0], step=step)
-
-    if opts.covariance:  # Append covariance directly to pySNIFS.spectrum
-        print("TODO: implement covariance")
-        # star_spec.cov = covspec
-
-    write_fits(star_spec, opts.out, inhdr)
-
-    # Save background spectrum ------------------------------
-
-    if not opts.sky:        # Use default sky spectrum name
-        opts.sky = 'sky_%s.fits' % (channel)
-    print("Saving output sky spectrum to '%s'" % opts.sky)
-    # Store variance as extension to signal
-    sky_spec = pySNIFS.spectrum(data=extraction['background_density'],
-                                var=extraction['background_density_variance'],
-                                start=full_cube.lbda[0], step=step)
-    write_fits(sky_spec, opts.sky, inhdr)
-
-    # Save 3D adjusted parameter file ------------------------------
+    # Write the point source and background spectra to fits files.
+    fitter.write_spectrum(opts.out, opts.sky)
 
     print("TODO: 3D log file")
     # if opts.log3D:
         # print("Producing 3D adjusted parameter logfile %s..." % opts.log3D)
         # create_3Dlog(opts, meta_cube, cube_fit, fitpar, dfitpar, chi2)
-
-    # Save adjusted PSF ------------------------------
-
-    if opts.keepmodel:
-        path, name = os.path.split(opts.out)
-        outpsf = os.path.join(path, 'psf_' + name)
-        print("Saving adjusted meta-slice PSF in 3D-fits cube '%s'..." %
-              outpsf)
-        cube_fit.WR_3d_fits(outpsf, header=[])  # No header in cube_fit
 
     # Create output graphics =================================================
 

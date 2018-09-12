@@ -241,3 +241,19 @@ def print_parameter(parameter_name, parameter_dict, do_uncertainties,
 
     print("%20s %s %10.4g %s%s" % (parameter_name, initial_value_str, value,
                                    uncertainty_str, message))
+
+
+def extract_key(item_list, key):
+    """Extract the value a key from each item in a list.
+
+    This returns a numpy array of the corresponding values. If an item is None,
+    then np.nan is returned for that item's value.
+    """
+    result = []
+    for item in item_list:
+        if item is None:
+            result.append(np.nan)
+        else:
+            result.append(item[key])
+    result = np.array(result)
+    return result
