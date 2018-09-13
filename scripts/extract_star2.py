@@ -290,9 +290,9 @@ if __name__ == "__main__":
                            "(>0: in \", <0: in seeing sigma) [%default]",
                       default=-5.)
     parser.add_option("-L", "--leastSquares",
-                      dest="chi2fit", action="store_false",
+                      dest="least_squares", action="store_true",
                       help="Least-square fit [default is a chi2 fit]",
-                      default=True)
+                      default=False)
 
     # Plotting
     parser.add_option("-g", "--graph",
@@ -387,6 +387,8 @@ if __name__ == "__main__":
             background_degree=opts.skyDeg,
             subsampling=opts.subsampling,
             border=opts.border,
+            least_squares=opts.least_squares,
+            prior_scale=opts.usePriors,
             verbosity=opts.verbosity
         )
     except scene_model.SceneModelException as e:

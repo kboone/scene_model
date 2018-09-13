@@ -440,7 +440,7 @@ def _plot_correlation(instance, names=None, covariance=None, **kwargs):
 
 class MultipleImageFitter():
     def __init__(self, scene_model, images, variances=None, priors=[],
-                 **kwargs):
+                 prior_scale=1., **kwargs):
         """Initialze a fitter for multiple images.
 
         The fitter will fit a scene model to every image. scene_model is either
@@ -471,17 +471,18 @@ class MultipleImageFitter():
         self._base_scene_model = scene_model
         self.scene_models = scene_models
 
+        self._global_fit_parameters = OrderedDict()
+        self._global_fixed_parameters = OrderedDict()
+
         # Add in priors and set initial values from them.
         self.priors = priors
+        self.prior_scale = prior_scale
         if priors:
             parameters = self.parameters
             for prior in self.priors:
                 if prior.set_initial_values:
                     parameters = prior.update_initial_values(self, parameters)
             self.set_parameters(update_derived=False, **parameters)
-
-        self._global_fit_parameters = OrderedDict()
-        self._global_fixed_parameters = OrderedDict()
 
         self.fit_result = None
         self.fit_initial_values = None
@@ -554,7 +555,7 @@ class MultipleImageFitter():
 
     def chi_square(self, global_parameters={}, individual_parameters=None,
                    do_analytic_coefficients=True, save_parameters=False,
-                   apply_fit_scale=False, apply_priors=True):
+                   apply_fit_scale=False, apply_priors=False):
         """Calculate the chi-square value for a given set of PSF parameters.
 
         global_parameters is a dictionary of parameters that are passed to
@@ -575,6 +576,9 @@ class MultipleImageFitter():
         predetermined amount that was calculated in _process_image, chosen such
         that the amplitude of the PSF is ~1. See SceneModel.chi_square for
         details.
+
+        If apply_priors is True, then the priors are applied to the resulting
+        chi-square.
         """
         if individual_parameters is None:
             # Use the default individual parameters.
@@ -606,9 +610,7 @@ class MultipleImageFitter():
             total_chi_square += model_chi_square
 
         if apply_priors:
-            prior_penalty = 0.
-            for prior in self.priors:
-                prior_penalty += prior.evaluate(global_parameters)
+            prior_penalty = self._evaluate_priors(global_parameters)
             total_chi_square += prior_penalty
 
         if save_parameters:
@@ -618,9 +620,25 @@ class MultipleImageFitter():
 
         return total_chi_square
 
-    def evaluate_priors(self, parameters):
-        """Evaluate the priors that have been set"""
-        return _evaluate_priors(parameters, self._priors)
+    def _evaluate_priors(self, full_parameters=None):
+        """Evaluate the priors and return the total penalty on the chi-square.
+
+        This returns the sum of all of the prior effects multiplied by the
+        prior scale.
+
+        full_parameters should be a dictionary of parameters that at least
+        contains every parameter that is used for the priors. If not specified,
+        it will be pulled directly from the model.
+        """
+        if full_parameters is None:
+            full_parameters = self.parameters
+
+        prior_penalty = 0.
+        for prior in self.priors:
+            prior_penalty += prior.evaluate(full_parameters)
+        prior_penalty *= self.prior_scale
+
+        return prior_penalty
 
     def _parse_start_fit_parameters(self, global_parameters,
                                     individual_parameters):
@@ -695,7 +713,7 @@ class MultipleImageFitter():
                                              individual_parameters)
 
         def chi_square_flat(flat_parameters, save_parameters=False,
-                            apply_fit_scale=True):
+                            apply_fit_scale=True, apply_priors=True, **kwargs):
             flat_parameters = flat_parameters
             fit_global_parameters, fit_individual_parameters = \
                 self._map_fit_parameters(flat_parameters, global_parameters,
@@ -707,6 +725,8 @@ class MultipleImageFitter():
                 do_analytic_coefficients=do_analytic_coefficients,
                 save_parameters=save_parameters,
                 apply_fit_scale=apply_fit_scale,
+                apply_priors=apply_priors,
+                **kwargs
             )
 
             return chi_square
@@ -725,12 +745,16 @@ class MultipleImageFitter():
 
         # Retrieve the unscaled parameters and save them.
         fit_parameters = res.x * scales
-        chi_square = chi_square_flat(fit_parameters, save_parameters=True,
-                                     apply_fit_scale=False)
+        chi_square = chi_square_flat(
+            fit_parameters, save_parameters=True, apply_fit_scale=False,
+            apply_priors=False
+        )
+        prior_penalty = self._evaluate_priors()
 
         self.fit_result = res
         self.fit_initial_values = dict(zip(parameter_names, initial_values))
         self.fit_chi_square = chi_square
+        self.fit_prior_penalty = prior_penalty
 
         if verbose:
             self.print_fit_info()
@@ -830,9 +854,14 @@ class MultipleImageFitter():
 
         if self.fit_result is not None:
             print("-"*70)
-            print("%20s: %g/%g" % ('chi2/dof', self.fit_result.fun,
+            print("%20s: %g/%g" % ('chi2/dof', self.fit_chi_square,
                                    self.degrees_of_freedom))
             print("%20s: %d" % ('nfev', self.fit_result.nfev))
+
+            if self.priors:
+                print("%20s: %g (scale=%g)" % ('prior penalty',
+                                               self.fit_prior_penalty,
+                                               self.prior_scale))
 
         print("="*70)
 

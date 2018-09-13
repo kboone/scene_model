@@ -899,7 +899,7 @@ class SnifsCubeFitter(object):
     def __init__(self, path, psf="fourier", background_degree=0,
                  subsampling=config.default_subsampling,
                  border=config.default_border, least_squares=False,
-                 verbosity=0, **kwargs):
+                 prior_scale=0., seeing_prior=None, verbosity=0):
         """Initialize the fitter.
 
         path is the path to the fits cube that will be extracted.
@@ -907,7 +907,8 @@ class SnifsCubeFitter(object):
         self.verbosity = verbosity
 
         self._read_cube(path)
-        self._setup_psf(psf, **kwargs)
+        self._setup_psf(psf, prior_scale=prior_scale,
+                        seeing_prior=seeing_prior)
 
         self.background_degree = background_degree
         self.subsampling = subsampling
@@ -927,9 +928,6 @@ class SnifsCubeFitter(object):
 
         # Extraction
         self.extraction = None
-
-        if least_squares:
-            raise SceneModelException("Least-squares is not implemented!")
 
         self.print_cube_info()
 
@@ -989,12 +987,13 @@ class SnifsCubeFitter(object):
         self.channel = channel
         self.adr_model = adr_model
 
-    def _setup_psf(self, psf, **kwargs):
+    def _setup_psf(self, psf, prior_scale=0., seeing_prior=None):
         """Set up a PSF to be fit. All PSF specific configuration should happen
         here.
         """
         scene_model_kwargs = {}
 
+        # Pick the PSF to fit
         if psf == "fourier":
             scene_model_class = SnifsFourierSceneModel
             seeing_degree = 1
@@ -1014,7 +1013,18 @@ class SnifsCubeFitter(object):
         else:
             raise SceneModelException("Unknown PSF %s!" % psf)
 
+        # Build a list of priors to apply
+        individual_priors = []
+        global_priors = []
+        if prior_scale > 0.:
+            # ADR prior is always applied for global fits
+            adr_prior = SnifsAdrPrior.from_fits_header(self.header)
+            global_priors.append(adr_prior)
+
         self.psf = psf
+        self.prior_scale = prior_scale
+        self.individual_priors = individual_priors
+        self.global_priors = global_priors
         self.scene_model_class = scene_model_class
         self.seeing_degree = seeing_degree
         self.seeing_key = seeing_key
@@ -1094,9 +1104,14 @@ class SnifsCubeFitter(object):
 
         for idx in range(len(meta_cube_data)):
             try:
+                if self.least_squares:
+                    var = None
+                else:
+                    var = meta_cube_var[idx]
+
                 # Crude Gaussian fit for initial position.
                 gaussian_model = GaussianSceneModel(
-                    meta_cube_data[idx], meta_cube_var[idx], subsampling=1,
+                    meta_cube_data[idx], var, subsampling=1,
                     border=0
                 )
                 gaussian_model.fix(rho=0.)
@@ -1109,7 +1124,9 @@ class SnifsCubeFitter(object):
                 # at the Gaussian fit location.
                 full_model = self.scene_model_class(
                     image=meta_cube_data[idx],
-                    variance=meta_cube_var[idx],
+                    variance=var,
+                    priors=self.individual_priors,
+                    prior_scale=self.prior_scale,
                     wavelength_dependence=False,
                     background_degree=self.background_degree,
                     subsampling=self.subsampling,
@@ -1264,10 +1281,17 @@ class SnifsCubeFitter(object):
 
         meta_cube_data, meta_cube_var = cube_to_arrays(self.meta_cube)
 
+        if self.least_squares:
+            var = None
+        else:
+            var = meta_cube_var
+
         fitter = MultipleImageFitter(
             scene_model,
             meta_cube_data,
-            meta_cube_var,
+            var,
+            priors=self.global_priors,
+            prior_scale=self.prior_scale,
         )
         fitter.fix(wavelength=self.meta_cube.lbda)
 
@@ -1283,7 +1307,7 @@ class SnifsCubeFitter(object):
         fit_scene_model = fitter.fit()
 
         # Calculate covariance matrix
-        print("Calculating covariance...")
+        print("  Calculating covariance...")
         try:
             covariance_names, covariance = fitter.calculate_covariance()
         except SceneModelException as e:

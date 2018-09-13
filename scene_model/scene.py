@@ -37,7 +37,8 @@ class SceneModel(object):
     Finally, the Background element adds a background component to the model.
     """
     def __init__(self, elements, image=None, variance=None, grid_size=None,
-                 priors=[], subsampling=config.default_subsampling,
+                 priors=[], prior_scale=1.,
+                 subsampling=config.default_subsampling,
                  border=config.default_border, shared_parameters=[], **kwargs):
         """Initialize a scene model.
 
@@ -69,6 +70,7 @@ class SceneModel(object):
 
         self.elements = []
         self.priors = priors
+        self.prior_scale = prior_scale
         self.shared_parameters = shared_parameters
 
         for element in elements:
@@ -565,7 +567,7 @@ class SceneModel(object):
 
     def chi_square(self, parameters={}, return_full_info=False,
                    do_analytic_coefficients=True, apply_fit_scale=False,
-                   apply_priors=True):
+                   apply_priors=False):
         """Calculate the chi-square value for a given set of model parameters.
 
         If apply_fit_scale is True, then the image is scaled by a predetermined
@@ -647,9 +649,7 @@ class SceneModel(object):
         chi_square = np.sum((use_data - fit_model)**2 / use_variance)
 
         if apply_priors:
-            prior_penalty = 0.
-            for prior in self.priors:
-                prior_penalty += prior.evaluate(full_parameters)
+            prior_penalty = self._evaluate_priors(full_parameters)
             chi_square += prior_penalty
 
         if return_full_info:
@@ -662,6 +662,26 @@ class SceneModel(object):
             self._chi_square_cache[call_info] = return_val
 
         return return_val
+
+    def _evaluate_priors(self, full_parameters=None):
+        """Evaluate the priors and return the total penalty on the chi-square.
+
+        This returns the sum of all of the prior effects multiplied by the
+        prior scale.
+
+        full_parameters should be a dictionary of parameters that at least
+        contains every parameter that is used for the priors. If not specified,
+        it will be pulled directly from the model.
+        """
+        if full_parameters is None:
+            full_parameters = self.parameters
+
+        prior_penalty = 0.
+        for prior in self.priors:
+            prior_penalty += prior.evaluate(full_parameters)
+        prior_penalty *= self.prior_scale
+
+        return prior_penalty
 
     def _calculate_coefficients(self, components, data, variance, mask,
                                 **parameters):
@@ -799,7 +819,8 @@ class SceneModel(object):
 
         self.fit_initial_values = dict(zip(parameter_names, initial_values))
 
-        def chi_square_flat(x, return_full_info=False, apply_fit_scale=True):
+        def chi_square_flat(x, return_full_info=False, apply_fit_scale=True,
+                            apply_priors=True):
             map_parameters = {i: j for i, j in zip(parameter_names, x)}
 
             return self.chi_square(
@@ -807,6 +828,7 @@ class SceneModel(object):
                 do_analytic_coefficients=do_analytic_coefficients,
                 return_full_info=return_full_info,
                 apply_fit_scale=apply_fit_scale,
+                apply_priors=apply_priors,
             )
 
         res = minimize(
@@ -826,13 +848,16 @@ class SceneModel(object):
         fit_parameters = res.x * scales
         chi_square, full_model, full_parameters = chi_square_flat(
             fit_parameters, return_full_info=True, apply_fit_scale=False,
+            apply_priors=False,
         )
+        prior_penalty = self._evaluate_priors()
 
         # Save the fit results.
         self.set_parameters(update_derived=False, **full_parameters)
         self.fit_model = full_model
         self.fit_result = res
         self.fit_chi_square = chi_square
+        self.fit_prior_penalty = prior_penalty
 
         if verbose:
             self.print_fit_info()
@@ -952,9 +977,14 @@ class SceneModel(object):
 
         if self.fit_result is not None:
             print("-"*70)
-            print("%20s: %g/%g" % ('chi2/dof', self.fit_result.fun,
+            print("%20s: %g/%g" % ('chi2/dof', self.fit_chi_square,
                                    self.degrees_of_freedom))
             print("%20s: %d" % ('nfev', self.fit_result.nfev))
+
+            if self.priors:
+                print("%20s: %g (scale=%g)" % ('prior penalty',
+                                               self.fit_prior_penalty,
+                                               self.prior_scale))
 
         print("="*70)
 
