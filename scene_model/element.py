@@ -175,7 +175,7 @@ class ModelElement(object):
         # Update the model name map dictionary.
         self._model_name_map[original_name] = new_name
 
-    def fix(self, model_name=False, **kwargs):
+    def fix(self, model_name=False, update_derived=False, **kwargs):
         """Fix a set of parameters to a given set of values.
 
         If the value that a parameter is set to is None, then the parameter is
@@ -203,8 +203,11 @@ class ModelElement(object):
                 # Unfix
                 parameter_dict['fixed'] = False
             else:
-                # Fix
-                parameter_dict['value'] = value
+                # Fix the value. Because we are often fixing things before the
+                # model is fully built, we don't update derived parameters by
+                # default.
+                self.set_parameters(update_derived=update_derived,
+                                    **{key: value})
                 parameter_dict['fixed'] = True
 
         self.clear_cache()

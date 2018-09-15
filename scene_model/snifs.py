@@ -2,19 +2,10 @@
 from __future__ import print_function
 
 import os
+from copy import deepcopy
 from astropy.io import fits
 from astropy.table import Table
 from scipy.optimize import leastsq
-
-# Import SNIFS libraries if available.
-try:
-    from ToolBox.Arrays import metaslice
-    from ToolBox.Astro import Coords
-    from ToolBox.Atmosphere import ADR
-    import pySNIFS
-except ImportError as e:
-    print("WARNING: Unable to load SNIFS libraries! (%s)" % e.message)
-    print("Some functionality will be disabled.")
 
 from . import config
 from .utils import SceneModelException, extract_key, nmad
@@ -34,8 +25,31 @@ from .prior import GaussianPrior, MultivariateGaussianPrior
 # If we are using autograd, then we need to use a special version of numpy.
 from .config import numpy as np
 
+# Import SNIFS libraries if available.
+try:
+    from ToolBox.Arrays import metaslice
+    from ToolBox.Astro import Coords
+    from ToolBox.Atmosphere import ADR
+    from ToolBox import MPL
+    import pySNIFS
+except ImportError as e:
+    print("WARNING: Unable to load SNIFS libraries! (%s)" % e.message)
+    print("Some functionality will be disabled.")
+
 
 rad_to_deg = 180. / np.pi
+
+# Definitions of reasonable parameters for SNIFS images. These are used to flag
+# potential issues with the fits, and to reject really bad fits.
+MAX_POSITION_PRIOR_OFFSET = 1    # Max position offset wrt. prior [spx]
+MAX_SEEING_PRIOR_OFFSET = 40     # Max seeing offset wrt. prior [%]
+MAX_AIRMASS_PRIOR_OFFSET = 20    # Max airmass offset wrt. prior [%]
+MAX_PARANG_PRIOR_OFFSET = 20     # Max parangle offset wrt. prior [deg]
+MAX_POSITION = 6                 # Max position wrt. FoV center [spx]
+
+MIN_SEEING = 0.3                 # Min reasonable seeing ['']
+MAX_SEEING = 4.0                 # Max reasonable seeing ['']
+MAX_AIRMASS = 4.                 # Max reasonable airmass
 
 
 def read_pressure_and_temperature(header, mauna_kea_pressure=616.,
@@ -531,23 +545,64 @@ class TrackingEllipticityPsfElement(PsfElement):
     choosing the (+1, 0) direction or the (0, +1) direction.
     """
     def _setup_parameters(self):
-        self._add_parameter('ell_coord_x', 0.1, (-30., 30.), 'ELLX',
+        self._add_parameter('ellipticity_x', 0.1, (-30., 30.), 'ELLX',
                             'Ellipticity coordinate in X direction')
-        self._add_parameter('ell_coord_y', 0.1, (-30., 30.), 'ELLY',
+        self._add_parameter('ellipticity_y', 0.1, (-30., 30.), 'ELLY',
                             'Ellipticity coordinate in Y direction')
 
-    def _evaluate_fourier(self, kx, ky, subsampling, grid_info, ell_coord_x,
-                          ell_coord_y, **kwargs):
+    def _evaluate_fourier(self, kx, ky, subsampling, grid_info, ellipticity_x,
+                          ellipticity_y, **kwargs):
         # Infinitesimally small minor axis
         rho = 0.99
 
         gaussian = np.exp(-0.5 * (
-            kx**2 * ell_coord_x**2 +
-            ky**2 * ell_coord_y**2 +
-            2. * kx * ky * rho * ell_coord_x * ell_coord_y
+            kx**2 * ellipticity_x**2 +
+            ky**2 * ellipticity_y**2 +
+            2. * kx * ky * rho * ellipticity_x * ellipticity_y
         ))
 
         return gaussian
+
+
+class SnifsClassicEllipticityPrior(MultivariateGaussianPrior):
+    """Add a prior on the ellipticity to a classic SNIFS model.
+
+    This is adapted from libExtractStar.py
+    """
+    def __init__(self, channel, airmass, **kwargs):
+        if channel == 'B':
+            intercept_ell, slope_ell, dispersion_ell = [1.730, -0.323, 0.221]
+            dispersion_xy = 0.041
+        elif channel == 'R':
+            intercept_ell, slope_ell, dispersion_ell = [1.934, -0.442, 0.269]
+            dispersion_xy = 0.050
+        else:
+            raise SceneModelException("Unknown channel %s" % channel)
+
+        predicted_ell = intercept_ell + slope_ell * airmass
+        predicted_xy = 0.
+
+        keys = ['ell', 'xy']
+        central_values = [predicted_ell, predicted_xy]
+        covariance = [[dispersion_ell**2, 0], [0, dispersion_xy**2]]
+
+        super(SnifsClassicEllipticityPrior, self).__init__(
+            keys, central_values, covariance, **kwargs
+        )
+
+    @classmethod
+    def from_fits_header(cls, header, **kwargs):
+        """Load the prior from a SNIFS fits header.
+
+        This only uses header parameters that come directly from the
+        instrument, and can be used for any SNIFS cube.
+        """
+        channel = header['CHANNEL']
+        airmass = header['AIRMASS']
+
+        prior = cls(channel, airmass, **kwargs)
+
+        return prior
 
 
 class SnifsFourierSeeingPrior(GaussianPrior):
@@ -590,13 +645,27 @@ class SnifsFourierEllipticityPrior(MultivariateGaussianPrior):
         predicted_ell_x = intercept_x + slope_x * airmass
         predicted_ell_y = intercept_y + slope_y * airmass
 
-        keys = ['ell_width_x', 'ell_width_y']
+        keys = ['ellipticity_x', 'ellipticity_y']
         central_values = [predicted_ell_x, predicted_ell_y]
         covariance = [[dispersion_x**2, 0], [0, dispersion_y**2]]
 
         super(SnifsFourierEllipticityPrior, self).__init__(
             keys, central_values, covariance, **kwargs
         )
+
+    @classmethod
+    def from_fits_header(cls, header, **kwargs):
+        """Load the prior from a SNIFS fits header.
+
+        This only uses header parameters that come directly from the
+        instrument, and can be used for any SNIFS cube.
+        """
+        channel = header['CHANNEL']
+        airmass = header['AIRMASS']
+
+        prior = cls(channel, airmass, **kwargs)
+
+        return prior
 
 
 class SnifsAdrPrior(MultivariateGaussianPrior):
@@ -899,7 +968,8 @@ class SnifsCubeFitter(object):
     def __init__(self, path, psf="fourier", background_degree=0,
                  subsampling=config.default_subsampling,
                  border=config.default_border, least_squares=False,
-                 prior_scale=0., seeing_prior=None, verbosity=0):
+                 prior_scale=0., seeing_prior=None, accountant=None,
+                 verbosity=0):
         """Initialize the fitter.
 
         path is the path to the fits cube that will be extracted.
@@ -914,6 +984,7 @@ class SnifsCubeFitter(object):
         self.subsampling = subsampling
         self.border = border
         self.least_squares = least_squares
+        self.accountant = accountant
 
         # Meta cube variables. These are set in fit_metaslices_2d
         self.meta_cube = None
@@ -922,12 +993,16 @@ class SnifsCubeFitter(object):
 
         # 3D fit results
         self.fitter_3d = None
+        self.fit_parameters = None
+        self.fit_uncertainties = None
         self.fit_scene_model = None
         self.meta_cube_model = None
         self.reference_seeing = None
 
         # Extraction
         self.extraction = None
+        self.point_source_spectrum = None
+        self.background_spectrum = None
 
         self.print_cube_info()
 
@@ -986,6 +1061,7 @@ class SnifsCubeFitter(object):
 
         self.channel = channel
         self.adr_model = adr_model
+        self.original_adr_model = deepcopy(adr_model)
 
     def _setup_psf(self, psf, prior_scale=0., seeing_prior=None):
         """Set up a PSF to be fit. All PSF specific configuration should happen
@@ -999,7 +1075,7 @@ class SnifsCubeFitter(object):
             seeing_degree = 1
             seeing_key = 'seeing_width'
             seeing_powerlaw_keys = ['seeing_ref_power', 'seeing_ref_width']
-            global_fit_keys = ['ell_coord_x', 'ell_coord_y']
+            global_fit_keys = ['ellipticity_x', 'ellipticity_y']
         elif psf == "classic":
             scene_model_class = SnifsClassicSceneModel
             seeing_degree = 2
@@ -1021,8 +1097,22 @@ class SnifsCubeFitter(object):
             adr_prior = SnifsAdrPrior.from_fits_header(self.header)
             global_priors.append(adr_prior)
 
+            # Ellipticity prior is always applied for both individual and
+            # global fits.
+            if psf == "fourier":
+                ell_prior = SnifsFourierEllipticityPrior.from_fits_header(
+                    self.header
+                )
+            elif psf == "classic":
+                ell_prior = SnifsClassicEllipticityPrior.from_fits_header(
+                    self.header
+                )
+            individual_priors.append(ell_prior)
+            global_priors.append(ell_prior)
+
         self.psf = psf
         self.prior_scale = prior_scale
+        self.seeing_prior = seeing_prior
         self.individual_priors = individual_priors
         self.global_priors = global_priors
         self.scene_model_class = scene_model_class
@@ -1045,7 +1135,7 @@ class SnifsCubeFitter(object):
                             cube.lbda[0], cube.lbda[-1], cube.nlens), 1)
 
         self.print_message("  Object: %s, Efftime: %.1fs, Airmass: %.2f" %
-                           (header.get('OBJECT', 'Unknown'), header['EFFTIME'],
+                           (self.object_name, header['EFFTIME'],
                             header['AIRMASS']))
 
         self.print_message("  PSF: %s, subsampling: %d, border: %d" %
@@ -1087,6 +1177,8 @@ class SnifsCubeFitter(object):
         else:
             meta_cube = pySNIFS.SNIFS_cube(fits3d_file=self.path,
                                            slices=slices)
+        meta_cube.x = meta_cube.i - np.max(meta_cube.i) / 2.
+        meta_cube.y = meta_cube.j - np.max(meta_cube.j) / 2.
         meta_cube_data, meta_cube_var = cube_to_arrays(meta_cube)
 
         self.print_message(
@@ -1174,7 +1266,7 @@ class SnifsCubeFitter(object):
 
         # Back-propagate positions to the reference wavelength, and take the
         # median value.
-        valid_xrefs, valid_yrefs = self.adr_model.refract(
+        valid_xrefs, valid_yrefs = self.original_adr_model.refract(
             x_centers[valid], y_centers[valid], meta_cube.lbda[valid],
             backward=True, unit=self.cube.spxSize
         )
@@ -1190,7 +1282,7 @@ class SnifsCubeFitter(object):
 
         # Cut out any images that didn't find PSFs at the right position.
         r = np.hypot(valid_xrefs - xref, valid_yrefs - yref)
-        rmax = 3 * nmad(r)
+        rmax = 3 * 1.4826 * np.median(r)    # Robust to outliers (~3*NMAD)
         good = np.zeros(num_meta_slices, dtype=bool)
         good[valid] = (r <= rmax)           # Valid fit and reasonable position
         bad = np.zeros(num_meta_slices, dtype=bool)
@@ -1233,7 +1325,10 @@ class SnifsCubeFitter(object):
             'center_y_uncertainty': y_center_errs,
             self.seeing_key: seeing_widths,
             '%s_uncertainty' % self.seeing_key: seeing_uncertainties,
-            'guess_seeing_widths': guess_seeing_widths,
+            'guess_%s' % self.seeing_key: guess_seeing_widths,
+            'guess_ref_center_x': xrefs,
+            'guess_ref_center_y': yrefs,
+            'guess_center_radius': np.ones(len(xrefs)) * rmax,
             'valid': valid,
             'good': good,
             'bad': bad,
@@ -1246,17 +1341,79 @@ class SnifsCubeFitter(object):
         metaslice_guesses = {
             'ref_center_x': ref_center_x_guess,
             'ref_center_y': ref_center_y_guess,
-            'adr_delta': self.adr_model.delta,
-            'adr_theta': self.adr_model.theta,
+            'adr_delta': self.original_adr_model.delta,
+            'adr_theta': self.original_adr_model.theta,
         }
         for key, value in zip(self.seeing_powerlaw_keys,
                               seeing_powerlaw_guesses):
             metaslice_guesses[key] = value
 
+        for key in self.global_fit_keys:
+            # Take the median value of other parameters that will be fit
+            # globally (eg: ellipticity)
+            values = extract_key(individual_scene_models, key)
+            guess_value = np.median(values[good])
+            metaslice_guesses[key] = guess_value
+
         # Save results
         self.meta_cube = meta_cube
         self.metaslice_info = metaslice_info
         self.metaslice_guesses = metaslice_guesses
+
+    def write_log_2d(self, path):
+        """Dump an informative text log about the PSF (metaslice) 2D-fit."""
+        self.print_message("Producing 2D adjusted parameter logfile %s..." %
+                           path)
+        logfile = open(path, 'w')
+
+        logfile.write('# cube    : %s   \n' % os.path.basename(self.path))
+        logfile.write('# object  : %s   \n' % self.header["OBJECT"])
+        logfile.write('# airmass : %.3f \n' % self.header["AIRMASS"])
+        logfile.write('# efftime : %.3f \n' % self.header["EFFTIME"])
+
+        failed_fits = []
+
+        first = True
+        for row in self.metaslice_info:
+            scene_model = row['scene_model']
+            parameters = scene_model.parameters
+            parameter_names = sorted(parameters.keys())
+            uncertainties = row['uncertainties']
+            wavelength = row['wavelength']
+            valid = row['valid']
+
+            if not valid:
+                # Fit failed, skip
+                logfile.write("# Fit failed for wavelength %.2f" % wavelength)
+
+            if first:
+                # Print a header.
+                first = False
+
+                header_str = "# wavelength"
+
+                for key in parameter_names:
+                    if key not in uncertainties:
+                        continue
+                    header_str += " %41s" % ("%s +/- d%s" % (key, key))
+
+                if self.least_squares:
+                    header_str += " %20s\n" % "RSS"
+                else:
+                    header_str += " %20s\n" % "chi2"
+                logfile.write(header_str)
+
+            # Print out each parameter
+            row_str = "%12.2f" % wavelength
+            for key in parameter_names:
+                if key not in uncertainties:
+                    continue
+                row_str += " %20g %20g" % (parameters[key], uncertainties[key])
+            row_str += " %20g\n" % scene_model.chi_square()
+
+            logfile.write(row_str)
+
+        logfile.close()
 
     def fit_metaslices_3d(self):
         self.print_message("Meta-slice 3D-fitting...")
@@ -1332,15 +1489,22 @@ class SnifsCubeFitter(object):
         )
 
         # Update ADR params
+        adr_delta = parameters['adr_delta']
+        adr_theta = parameters['adr_theta']
+        self.adr_model.set_param(delta=adr_delta, theta=adr_theta)
         self.print_message(
             "  ADR fit: delta=%.2f±%.2f, theta=%.1f±%.1f deg" %
-            (parameters['adr_delta'], uncertainties['adr_delta'],
-             parameters['adr_theta'] * rad_to_deg, uncertainties['adr_theta'] *
-             rad_to_deg), 1
+            (adr_delta, uncertainties['adr_delta'], adr_theta * rad_to_deg,
+             uncertainties['adr_theta'] * rad_to_deg), 1
         )
-
         self.print_message("  Effective airmass: %.2f" %
                            self.adr_model.get_airmass())
+
+        # Calculate the fitted center positions in each metaslice
+        fit_center_x, fit_center_y = self.adr_model.refract(
+            parameters['ref_center_x'], parameters['ref_center_y'],
+            self.meta_cube.lbda, unit=self.cube.spxSize
+        )
 
         # Estimated seeing (FWHM in arcsec)
         reference_seeing = self.cube.spxSize * fit_scene_model.calculate_fwhm(
@@ -1367,15 +1531,154 @@ class SnifsCubeFitter(object):
 
         # Create a standard SNIFS cube with the meta cube model
         meta_cube_model = pySNIFS.SNIFS_cube(lbda=self.meta_cube.lbda)
+        meta_cube_model.x = meta_cube_model.i - np.max(meta_cube_model.i) / 2.
+        meta_cube_model.y = meta_cube_model.j - np.max(meta_cube_model.j) / 2.
         model = fitter.evaluate()[:, meta_cube_model.i, meta_cube_model.j]
         meta_cube_model.data = model
 
         # Save results
         self.metaslice_info['fit_seeing_widths'] = fit_seeing_widths
+        self.metaslice_info['fit_center_x'] = fit_center_x
+        self.metaslice_info['fit_center_y'] = fit_center_y
         self.fitter_3d = fitter
+        self.fit_parameters = fitter.parameters
+        self.fit_uncertainties = uncertainties
         self.fit_scene_model = fit_scene_model
         self.meta_cube_model = meta_cube_model
         self.reference_seeing = reference_seeing
+
+    def write_log_3d(self, path):
+        """Dump an informative text log about the PSF (full-cube) 3D-fit."""
+        self.print_message("Producing 3D adjusted parameter logfile %s..." %
+                           path)
+        logfile = open(path, 'w')
+
+        logfile.write('# cube    : %s   \n' % os.path.basename(self.path))
+        logfile.write('# object  : %s   \n' % self.header["OBJECT"])
+        logfile.write('# airmass : %.3f \n' % self.header["AIRMASS"])
+        logfile.write('# efftime : %.3f \n' % self.header["EFFTIME"])
+
+        parameters = self.fit_parameters
+        uncertainties = self.fit_uncertainties
+        parameter_names = sorted(self.fit_parameters.keys())
+
+        # Global parameters
+        logfile.write("# Global parameters\n")
+        logfile.write("# %18s %20s %20s\n" % ("name", "value", "uncertainty"))
+        for name in parameter_names:
+            value = parameters[name]
+            if not np.isscalar(value):
+                # A non-global parameter, skip it for now
+                continue
+
+            logfile.write("%20s %20g %20g\n" % (name, value,
+                                                uncertainties[name]))
+        if self.least_squares:
+            name = "RSS"
+        else:
+            name = "chi2"
+        logfile.write("%20s %20s\n" % (name, self.fitter_3d.fit_chi_square))
+
+        # Individual parameters
+        logfile.write("# Individual parameters\n")
+        first = True
+        for i in range(len(self.metaslice_info)):
+            wavelength = self.metaslice_info[i]['wavelength']
+
+            if first:
+                # Print a header.
+                first = False
+
+                header_str = "# wavelength"
+
+                for key in parameter_names:
+                    if np.isscalar(parameters[key]):
+                        continue
+                    header_str += " %41s" % ("%s +/- d%s" % (key, key))
+
+                if self.least_squares:
+                    header_str += " %20s\n" % "RSS"
+                else:
+                    header_str += " %20s\n" % "chi2"
+                logfile.write(header_str)
+
+            # Print out each parameter
+            row_str = "%12.2f" % wavelength
+            for key in parameter_names:
+                if np.isscalar(parameters[key]):
+                    continue
+                row_str += " %20g %20g" % (parameters[key][i],
+                                           uncertainties[key][i])
+            row_str += " %20g\n" % self.fitter_3d.scene_models[i].chi_square()
+
+            logfile.write(row_str)
+
+        logfile.close()
+
+    def check_validity(self):
+        """Check the validity of the model.
+
+        This adds warnings to the accountant for parameters that are far from
+        their predicted values, and raises a SceneModelException if the
+        parameters are unphysical.
+        """
+        if self.prior_scale > 0.:
+            # Test on seeing
+            if self.seeing_prior:
+                fac = (self.reference_seeing / self.seeing_prior - 1) * 1e2
+                if abs(fac) > MAX_SEEING_PRIOR_OFFSET:
+                    print("WARNING: Seeing %.2f\" is %+.0f%% away from "
+                          "predicted %.2f\"" % (self.reference_seeing,
+                                                fac, self.seeing_prior))
+                    if self.accountant:
+                        self.accountant.add_warning("ES_PRIOR_SEEING")
+
+            # Tests on ADR parameters
+            original_airmass = self.original_adr_model.get_airmass()
+            fit_airmass = self.adr_model.get_airmass()
+            fac = (fit_airmass / original_airmass - 1) * 1e2
+            if abs(fac) > MAX_AIRMASS_PRIOR_OFFSET:
+                print("WARNING: Airmass %.2f is %+.0f%% away from "
+                      "predicted %.2f" % (fit_airmass, fac, original_airmass))
+                if self.accountant:
+                    self.accountant.add_warning("ES_PRIOR_AIRMASS")
+
+            # Rewrap angle difference [rad]
+            original_theta = self.original_adr_model.theta
+            fit_theta = self.adr_model.theta
+            err = (((fit_theta - original_theta) + np.pi) %
+                   (2 * np.pi) - np.pi) * rad_to_deg
+            if abs(err) > MAX_PARANG_PRIOR_OFFSET:
+                print("WARNING: Parangle %.0fdeg is %+.0fdeg away from "
+                      "predicted %.0fdeg" %
+                      (self.adr_model.get_parangle(), err,
+                       self.original_adr_model.get_parangle()))
+                if self.accountant:
+                    self.accountant.add_warning("ES_PRIOR_PARANGLE")
+
+        ref_center_x = self.fit_parameters['ref_center_x']
+        ref_center_y = self.fit_parameters['ref_center_y']
+        if not (abs(ref_center_x) < MAX_POSITION and
+                abs(ref_center_y) < MAX_POSITION):
+            print("WARNING: Point-source %+.2f x %+.2f mis-centered" %
+                  (ref_center_x, ref_center_y))
+            if self.accountant:
+                self.accountant.add_warning("ES_MIS-CENTERED")
+
+        # Tests on seeing and airmass
+        if not MIN_SEEING < self.reference_seeing < MAX_SEEING:
+            raise SceneModelException("Unphysical seeing (%.2f\")" %
+                                      self.reference_seeing)
+        if not 1. <= self.adr_model.get_airmass() < MAX_AIRMASS:
+            raise SceneModelException("Unphysical airmass (%.2f)" %
+                                      self.adr_model.get_airmass())
+        # Test positivity of alpha and ellipticity
+        fit_seeing_widths = self.metaslice_info['fit_seeing_widths']
+        if fit_seeing_widths.min() < 0:
+            raise SceneModelException(
+                "Seeing widths are negative (%.2f) at %.0f A" %
+                (fit_seeing_widths.min(),
+                 self.meta_cube.lbda[fit_seeing_widths.argmin()]))
 
     def extract(self):
         # Make sure that the 3D fit has already been done.
@@ -1392,12 +1695,32 @@ class SnifsCubeFitter(object):
             cube_data, cube_var, wavelength=self.cube.lbda
         )
 
-        # Convert (mean) sky spectrum to "per arcsec**2"
-        spaxel_size = self.cube.spxSize
-        extraction['background_density'] = \
-            extraction['background'] / spaxel_size**2
-        extraction['background_density_variance'] = \
-            extraction['background_variance'] / spaxel_size**4
+        # Build a pySNIFS object for the point source
+        point_source_spectrum = pySNIFS.spectrum(
+            data=extraction['amplitude'],
+            var=extraction['amplitude_variance'],
+            start=self.cube.lbda[0],
+            step=self.cube.lstep,
+        )
+        self.point_source_spectrum = point_source_spectrum
+
+        if self.has_sky:
+            # Convert (mean) sky spectrum to "per arcsec**2"
+            spaxel_size = self.cube.spxSize
+            extraction['background_density'] = \
+                extraction['background'] / spaxel_size**2
+            if self.has_sky:
+                extraction['background_density_variance'] = \
+                    extraction['background_variance'] / spaxel_size**4
+
+            # Build a pySNIFS object for the background
+            sky_spectrum = pySNIFS.spectrum(
+                data=extraction['background_density'],
+                var=extraction['background_density_variance'],
+                start=self.cube.lbda[0],
+                step=self.cube.lstep,
+            )
+            self.sky_spectrum = sky_spectrum
 
         self.extraction = extraction
 
@@ -1407,7 +1730,7 @@ class SnifsCubeFitter(object):
         # Make sure that the extraction has already been done
         if self.extraction is None:
             raise SceneModelException(
-                "Must run the 3D metaslice fit before extracting!"
+                "Must run the extraction to produce spectra!"
             )
 
         # Build the header for the output file. We start with the input header
@@ -1438,33 +1761,862 @@ class SnifsCubeFitter(object):
         header[p('SUB')] = (self.subsampling, 'Model subsampling')
         header[p('BORD')] = (self.border, 'Model border')
 
-        # Total sky flux (per arcsec**2)
         tflux = self.extraction['amplitude'].sum()
-        sflux = self.extraction['background_density'].sum()
-
         header[p('TFLUX')] = (tflux, 'Total point-source flux')
-        header[p('SFLUX')] = (sflux, 'Total sky flux/arcsec^2')
+
+        if self.has_sky:
+            sflux = self.extraction['background_density'].sum()
+            header[p('SFLUX')] = (sflux, 'Total sky flux/arcsec^2')
+
         header['SEEING'] = (self.reference_seeing,
                             'Estimated seeing @lbdaRef ["] (extract_star2)')
 
-        print("TODO: add prior info to header")
+        if self.prior_scale > 0.:
+            header['ES_PRIOR'] = (self.prior_scale, 'Prior hyper-scale')
+            if self.seeing_prior is not None:
+                header['ES_PRISE'] = (self.seeing_prior,
+                                      'Seeing prior [arcsec]')
 
         # Save the point source spectrum
         print("Saving output point-source spectrum to '%s'" % output_path)
-        point_source_spectrum = pySNIFS.spectrum(
-            data=self.extraction['amplitude'],
-            var=self.extraction['amplitude_variance'],
-            start=self.cube.lbda[0],
-            step=self.cube.lstep,
-        )
-        write_pysnifs_spectrum(point_source_spectrum, output_path, header)
+        write_pysnifs_spectrum(self.point_source_spectrum, output_path, header)
 
-        # Save the sky spectrum
-        print("Saving output sky spectrum to '%s'" % sky_output_path)
-        sky_spectrum = pySNIFS.spectrum(
-            data=self.extraction['background_density'],
-            var=self.extraction['background_density_variance'],
-            start=self.cube.lbda[0],
-            step=self.cube.lstep,
+        if self.has_sky:
+            # Save the sky spectrum
+            print("Saving output sky spectrum to '%s'" % sky_output_path)
+            write_pysnifs_spectrum(self.sky_spectrum, sky_output_path, header)
+
+    @property
+    def has_sky(self):
+        """Return True if the model has a sky component, False otherwise"""
+        return self.background_degree != -1
+
+    @property
+    def object_name(self):
+        """Return the name of the object"""
+        object_name = self.header.get('OBJECT', 'Unknown')
+        return object_name
+
+    def plot_spectrum(self, path=None):
+        """Plot the extracted spectrum.
+
+        If path is set, the spectrum is written to a file at that path.
+        """
+        # Make sure that the extraction is done.
+        if self.extraction is None:
+            raise SceneModelException(
+                "Must run the extraction before plotting spectra!"
+            )
+
+        point_spec = self.point_source_spectrum
+        sky_spec = self.sky_spectrum
+
+        if path is not None:
+            self.print_message("Producing spectra plot %s..." % path, 1)
+
+        from matplotlib import pyplot as plt
+
+        fig = plt.figure()
+
+        if self.has_sky and sky_spec.data.any():
+            axS = fig.add_subplot(3, 1, 1)  # Point-source
+            axB = fig.add_subplot(3, 1, 2)  # Sky
+            axN = fig.add_subplot(3, 1, 3)  # S/N
+        else:
+            axS = fig.add_subplot(2, 1, 1)  # Point-source
+            axN = fig.add_subplot(2, 1, 2)  # S/N
+
+        axS.text(0.95, 0.8, os.path.basename(self.path), fontsize='small',
+                 ha='right', transform=axS.transAxes)
+
+        axS.plot(point_spec.x, point_spec.data, MPL.blue)
+        axS.errorband(point_spec.x, point_spec.data, np.sqrt(point_spec.var),
+                      color=MPL.blue)
+        axN.plot(point_spec.x, point_spec.data / np.sqrt(point_spec.var),
+                 MPL.blue)
+
+        if self.has_sky and sky_spec.data.any():
+            axB.plot(sky_spec.x, sky_spec.data, MPL.green)
+            axB.errorband(sky_spec.x, sky_spec.data, np.sqrt(sky_spec.var),
+                          color=MPL.green)
+            axB.set(title=u"Background spectrum (per arcsec²)",
+                    xlim=(sky_spec.x[0], sky_spec.x[-1]),
+                    xticklabels=[])
+
+            # Sky S/N
+            axN.plot(sky_spec.x, sky_spec.data / np.sqrt(sky_spec.var),
+                     MPL.green)
+
+        axS.set(title="Point-source spectrum [%s]" % (self.object_name),
+                xlim=(point_spec.x[0], point_spec.x[-1]), xticklabels=[])
+        axN.set(title="Signal/Noise", xlabel=u"Wavelength [Å]",
+                xlim=(point_spec.x[0], point_spec.x[-1]))
+
+        fig.tight_layout()
+        if path:
+            fig.savefig(path)
+
+    def plot_slice_fit(self, path=None):
+        """Plot the fits to each slice.
+
+        If path is set, the plot is written to a file at that path.
+        """
+        # Make sure that the 3D fit has already been done.
+        if self.fit_scene_model is None:
+            raise SceneModelException(
+                "Must run the 3D metaslice fit before plotting slices!"
+            )
+
+        if path is not None:
+            self.print_message("Producing slice fit plot %s..." % path, 1)
+
+        from matplotlib import pyplot as plt
+
+        num_meta_slices = self.meta_cube.nslice
+        ncol = int(np.floor(np.sqrt(num_meta_slices)))
+        nrow = int(np.ceil(num_meta_slices / float(ncol)))
+
+        fig = plt.figure()
+        fig.suptitle("Slice plots [%s, airmass=%.2f]" %
+                     (self.object_name, self.header['AIRMASS']),
+                     fontsize='large')
+
+        # Compute all of the model components on an incomplete cube. components
+        # will have the shape (num_meta_slices, num_components, num_spaxels)
+        full_components = self.fitter_3d.evaluate(separate_components=True)
+        components = full_components[..., self.meta_cube.i, self.meta_cube.j]
+        model = np.sum(components, axis=1)
+        spaxel_numbers = np.sort(self.meta_cube.no)
+        num_components = components.shape[1]
+
+        # Make a plot for each meta slice
+        for i in range(num_meta_slices):
+            data = self.meta_cube.data[i, :]
+            fit = model[i, :]
+            ax = fig.add_subplot(nrow, ncol, i + 1)
+            ax.plot(spaxel_numbers, data, color=MPL.blue, ls='-')  # Signal
+            if self.meta_cube.var is not None:
+                ax.errorband(spaxel_numbers, data,
+                             np.sqrt(self.meta_cube.var[i, :]), color=MPL.blue)
+            ax.plot(spaxel_numbers, fit, color=MPL.red, ls='-')   # Model
+
+            # Plot the individual components.
+            colors = [MPL.green, MPL.orange, MPL.purple, MPL.yellow, MPL.brown]
+            for component_idx in range(num_components):
+                ax.plot(spaxel_numbers, components[i][component_idx],
+                        color=colors[component_idx % len(colors)], ls='-')
+            plt.setp(ax.get_xticklabels() + ax.get_yticklabels(),
+                     fontsize='xx-small')
+            ax.text(0.05, 0.85, u"%.0f Å" % self.meta_cube.lbda[i],
+                    fontsize='x-small', transform=ax.transAxes)
+
+            ax.set_ylim(data.min() / 1.2, data.max() * 1.2)
+            ax.set_xlim(-1, 226)
+            if ax.is_last_row() and ax.is_first_col():
+                ax.set_xlabel("Spaxel #", fontsize='small')
+                ax.set_ylabel("Flux", fontsize='small')
+
+        fig.subplots_adjust(left=0.07, right=0.96, bottom=0.06, top=0.94)
+        if path:
+            fig.savefig(path)
+
+    def plot_row_column_sums(self, path=None):
+        """Plot the sums of each row and column for each slice.
+
+        If path is set, the plot is written to a file at that path.
+        """
+        # Make sure that the 3D fit has already been done.
+        if self.fit_scene_model is None:
+            raise SceneModelException(
+                "Must run the 3D metaslice fit before plotting slices!"
+            )
+
+        if path is not None:
+            self.print_message("Producing profile plot %s..." % path, 1)
+
+        from matplotlib import pyplot as plt
+
+        fig = plt.figure()
+        fig.suptitle("Rows and columns [%s, airmass=%.2f]" %
+                     (self.object_name, self.header['AIRMASS']),
+                     fontsize='large')
+
+        num_meta_slices = self.meta_cube.nslice
+        ncol = int(np.floor(np.sqrt(num_meta_slices)))
+        nrow = int(np.ceil(num_meta_slices / float(ncol)))
+
+        for i in range(num_meta_slices):
+            ax = fig.add_subplot(nrow, ncol, i + 1)
+
+            # Signal
+            signal_slice = self.meta_cube.slice2d(i, coord='p', NAN=False)
+            row_profile = signal_slice.sum(axis=0)  # Sum along rows
+            col_profile = signal_slice.sum(axis=1)  # Sum along columns
+
+            # Errors
+            if self.least_squares:
+                # Least-squares, don't show errorbars.
+                ax.plot(range(len(row_profile)), row_profile,
+                        marker='o', c=MPL.blue, ms=3, ls='None')
+                ax.plot(range(len(col_profile)), col_profile,
+                        marker='^', c=MPL.red, ms=3, ls='None')
+            else:
+                # Chi-square, show errorbars
+                var_slice = self.meta_cube.slice2d(i, coord='p', var=True,
+                                                   NAN=False)
+                row_err = np.sqrt(var_slice.sum(axis=0))
+                col_err = np.sqrt(var_slice.sum(axis=1))
+                ax.errorbar(range(len(row_profile)), row_profile, row_err,
+                            fmt='o', c=MPL.blue, ecolor=MPL.blue, ms=3)
+                ax.errorbar(range(len(col_profile)), col_profile, col_err,
+                            fmt='^', c=MPL.red, ecolor=MPL.red, ms=3)
+
+            # Model
+            model_slice = self.meta_cube_model.slice2d(i, coord='p')
+            row_model = model_slice.sum(axis=0)
+            col_model = model_slice.sum(axis=1)
+            ax.plot(row_model, ls='-', color=MPL.blue)
+            ax.plot(col_model, ls='-', color=MPL.red)
+
+            plt.setp(ax.get_xticklabels() + ax.get_yticklabels(),
+                     fontsize='xx-small')
+            ax.text(0.05, 0.85, u"%.0f Å" % self.meta_cube.lbda[i],
+                    fontsize='x-small', transform=ax.transAxes)
+            if ax.is_last_row() and ax.is_first_col():
+                ax.set_xlabel("I (blue) or J (red)", fontsize='small')
+                ax.set_ylabel("Flux", fontsize='small')
+
+            fig.subplots_adjust(left=0.06, right=0.96, bottom=0.06, top=0.95)
+
+    def plot_adr(self, path=None):
+        """Plot the ADR fit
+
+        If path is set, the plot is written to a file at that path.
+        """
+        # Make sure that the 3D fit has already been done.
+        if self.fit_scene_model is None:
+            raise SceneModelException(
+                "Must run the 3D metaslice fit before plotting the ADR!"
+            )
+
+        if path is not None:
+            self.print_message("Producing ADR plot %s..." % path, 1)
+
+        import matplotlib
+        from matplotlib import pyplot as plt
+
+        # Accomodate errorbar fmt API change at v2.2.0
+        # (https://matplotlib.org/api/api_changes.html#function-signatures)
+        if matplotlib.__version__ >= '2.2.0':
+            NONE = 'none'
+        else:
+            NONE = None
+
+        wavelengths = self.meta_cube.lbda
+        spaxel_size = self.cube.spxSize
+        fit_ref_center_x = self.fit_scene_model['ref_center_x']
+        fit_ref_center_y = self.fit_scene_model['ref_center_y']
+        guess_ref_center_x = self.metaslice_guesses['ref_center_x']
+        guess_ref_center_y = self.metaslice_guesses['ref_center_y']
+
+        # Calculate offsets to shift positions to the middle of the fit
+        # wavelength range. The reference position can float, so it makes more
+        # sense to anchor it at the middle wavelength rather than at the
+        # reference wavelength for plotting purposes.
+        mid_wavelength = np.median(wavelengths)
+        guess_mid_x, guess_mid_y = self.original_adr_model.refract(
+            guess_ref_center_x, guess_ref_center_y, mid_wavelength,
+            unit=spaxel_size
         )
-        write_pysnifs_spectrum(sky_spectrum, sky_output_path, header)
+        fit_mid_x, fit_mid_y = self.adr_model.refract(
+            fit_ref_center_x, fit_ref_center_y, mid_wavelength,
+            unit=spaxel_size
+        )
+
+        # Retrieve positions from individual fits
+        individual_x = self.metaslice_info['center_x']
+        individual_y = self.metaslice_info['center_y']
+        individual_x_err = self.metaslice_info['center_x_uncertainty']
+        individual_y_err = self.metaslice_info['center_y_uncertainty']
+
+        # Calculate positions using the original ADR model read from the
+        # header.
+        guess_x, guess_y = self.original_adr_model.refract(
+            guess_ref_center_x, guess_ref_center_y, wavelengths,
+            unit=spaxel_size
+        )
+        mid_individual_x = individual_x + guess_mid_x - guess_x
+        mid_individual_y = individual_y + guess_mid_y - guess_y
+
+        # Positions after the 3D fit
+        fit_x = self.metaslice_info['fit_center_x']
+        fit_y = self.metaslice_info['fit_center_y']
+
+        fig = plt.figure()
+
+        ax3 = fig.add_subplot(
+            2, 1, 1,
+            aspect='equal',
+            adjustable='datalim',
+            xlabel="X center [spx]",
+            ylabel="Y center [spx]",
+            title="ADR plot [%s, airmass=%.2f]" % (self.object_name,
+                                                   self.header['AIRMASS'])
+        )
+        ax1 = fig.add_subplot(
+            2, 2, 3,
+            xlabel=u"Wavelength [Å]",
+            ylabel="X center [spx]"
+        )
+        ax2 = fig.add_subplot(
+            2, 2, 4,
+            xlabel=u"Wavelength [Å]",
+            ylabel="Y center [spx]"
+        )
+
+        valid = self.metaslice_info['valid']
+        good = self.metaslice_info['good']
+        bad = self.metaslice_info['bad']
+
+        # Should all have the same radius, so we can pick the first one.
+        good_radius = self.metaslice_info['guess_center_radius'][0]
+
+        if good.any():
+            ax1.errorbar(wavelengths[good], individual_x[good],
+                         yerr=individual_x_err[good], fmt=NONE,
+                         ecolor=MPL.green)
+            ax1.scatter(wavelengths[good], individual_x[good],
+                        edgecolors='none', c=wavelengths[good],
+                        cmap=plt.cm.jet, zorder=3, label="Fit 2D")
+        if bad.any():
+            ax1.plot(wavelengths[bad], individual_x[bad], mfc=MPL.red,
+                     mec=MPL.red, marker='.', ls='None', label='_')
+        ax1.plot(wavelengths, guess_x, 'k--', label="Guess 3D")
+        ax1.plot(wavelengths, fit_x, MPL.green, label="Fit 3D")
+        plt.setp(ax1.get_xticklabels() + ax1.get_yticklabels(),
+                 fontsize='xx-small')
+        ax1.legend(loc='best', fontsize='small', frameon=False)
+
+        if good.any():
+            ax2.errorbar(wavelengths[good], individual_y[good],
+                         yerr=individual_y_err[good], fmt=NONE,
+                         ecolor=MPL.green)
+            ax2.scatter(wavelengths[good], individual_y[good],
+                        edgecolors='none', c=wavelengths[good],
+                        cmap=plt.cm.jet, zorder=3)
+        if bad.any():
+            ax2.plot(wavelengths[bad], individual_y[bad], marker='.',
+                     mfc=MPL.red, mec=MPL.red, ls='None')
+        ax2.plot(wavelengths, guess_y, 'k--')
+        ax2.plot(wavelengths, fit_y, MPL.green)
+        plt.setp(ax2.get_xticklabels() + ax2.get_yticklabels(),
+                 fontsize='xx-small')
+
+        if valid.any():
+            ax3.errorbar(individual_x[valid], individual_y[valid],
+                         xerr=individual_x_err[valid],
+                         yerr=individual_y_err[valid], fmt=NONE,
+                         ecolor=MPL.green)
+
+        if good.any():
+            ax3.scatter(individual_x[good], individual_y[good],
+                        edgecolors='none', c=wavelengths[good],
+                        cmap=plt.cm.jet, zorder=3)
+            # Plot position selection process
+            ax3.plot(mid_individual_x[good], mid_individual_y[good],
+                     marker='.', mfc=MPL.blue, mec=MPL.blue, ls='None')
+        if bad.any():
+            # Discarded ref. positions
+            ax3.plot(mid_individual_x[bad], mid_individual_y[bad], marker='.',
+                     mfc=MPL.red, mec=MPL.red, ls='None')
+        ax3.plot((guess_mid_x, fit_mid_x), (guess_mid_y, fit_mid_y), 'k-')
+        ax3.plot(guess_x, guess_y, 'k--')  # Guess ADR
+        ax3.plot(fit_x, fit_y, MPL.green)      # Adjusted ADR
+        ax3.set_autoscale_on(False)
+        ax3.plot((fit_mid_x,), (fit_mid_y,), 'k+')
+        ax3.add_patch(matplotlib.patches.Circle(
+            (guess_mid_x, guess_mid_y), radius=good_radius, ec='0.8',
+            fc='None'))
+        # ADR selection
+        ax3.add_patch(matplotlib.patches.Rectangle(
+            (-7.5, -7.5), 15, 15, ec='0.8', lw=2, fc='None'))
+        # FoV
+        txt = u'Guess: x0,y0=%+4.2f,%+4.2f  airmass=%.2f parangle=%+.0f°' % \
+              (guess_ref_center_x, guess_ref_center_y,
+               self.original_adr_model.get_airmass(),
+               self.original_adr_model.get_parangle())
+        txt += u'\nFit: x0,y0=%+4.2f,%+4.2f  airmass=%.2f parangle=%+.0f°' % \
+               (fit_ref_center_x, fit_ref_center_y,
+                self.adr_model.get_airmass(), self.adr_model.get_parangle())
+        txtcol = 'k'
+
+        if self.accountant:
+            accountant = self.accountant
+            if accountant.test_warning('ES_PRIOR_POSITION'):
+                txt += '\n%s' % accountant.get_warning('ES_PRIOR_POSITION')
+                txtcol = MPL.red
+            if accountant.test_warning('ES_PRIOR_AIRMASS'):
+                txt += '\n%s' % accountant.get_warning('ES_PRIOR_AIRMASS')
+                txtcol = MPL.red
+            if accountant.test_warning('ES_PRIOR_PARANGLE'):
+                txt += '\n%s' % accountant.get_warning('ES_PRIOR_PARANGLE')
+                txtcol = MPL.red
+
+        ax3.text(0.95, 0.8, txt, transform=ax3.transAxes, fontsize='small',
+                 ha='right', color=txtcol)
+
+        fig.tight_layout()
+        if path:
+            fig.savefig(path)
+
+    def plot_ellipticity(self, path=None):
+        """Plot the ellipticity parameters
+
+        If path is set, the plot is written to a file at that path.
+        """
+        # Make sure that the 3D fit has already been done.
+        if self.fit_scene_model is None:
+            raise SceneModelException(
+                "Must run the 3D metaslice fit before plotting ellipticity!"
+            )
+
+        if path is not None:
+            self.print_message("Producing ellipticity plot %s..." % path, 1)
+
+        import matplotlib
+        from matplotlib import pyplot as plt
+
+        # The first subplot is seeing. The other 2 subplots will show different
+        # things for the different PSFs.
+        if self.psf == 'classic':
+            key_2 = 'ell'
+            key_3 = 'xy'
+            label_1 = u'α [spx]'
+            label_2 = u'y² coeff.'
+            label_3 = u'xy coeff.'
+        elif self.psf == 'fourier':
+            key_2 = 'ellipticity_x'
+            key_3 = 'ellipticity_y'
+            label_1 = 'seeing width [spx]'
+            label_2 = 'ellipticity x'
+            label_3 = 'ellipticity y'
+        else:
+            raise SceneModelException("Can't make ellipticity plot for PSF %s"
+                                      % self.psf)
+
+        wavelengths = self.meta_cube.lbda
+
+        val_2 = extract_key(self.metaslice_info['scene_model'], key_2)
+        err_2 = extract_key(self.metaslice_info['uncertainties'], key_2)
+        val_3 = extract_key(self.metaslice_info['scene_model'], key_3)
+        err_3 = extract_key(self.metaslice_info['uncertainties'], key_3)
+
+        guess_2 = self.metaslice_guesses[key_2]
+        guess_3 = self.metaslice_guesses[key_3]
+
+        fit_2 = self.fit_parameters[key_2]
+        fit_3 = self.fit_parameters[key_3]
+        fit_err_2 = self.fit_uncertainties[key_2]
+        fit_err_3 = self.fit_uncertainties[key_3]
+
+        def plot_conf_interval(ax, x, y, dy):
+            ax.plot(x, y, MPL.green, label="Fit 3D")
+            if dy is not None:
+                ax.errorband(x, y, dy, color=MPL.green)
+
+        fig = plt.figure()
+
+        ax1 = fig.add_subplot(
+            2, 1, 1,
+            title='Model parameters '
+            '[%s, seeing %.2f" FWHM]' % (self.object_name,
+                                         self.reference_seeing),
+            xticklabels=[],
+            ylabel=label_1
+        )
+        ax2 = fig.add_subplot(4, 1, 3, xticklabels=[], ylabel=label_2)
+        ax3 = fig.add_subplot(4, 1, 4, xlabel=u"Wavelength [Å]",
+                              ylabel=label_3)
+
+        good = self.metaslice_info['good']
+        bad = self.metaslice_info['bad']
+
+        if good.any():
+            ax1.errorbar(
+                wavelengths[good],
+                self.metaslice_info[self.seeing_key][good],
+                self.metaslice_info['%s_uncertainty' % self.seeing_key][good],
+                marker='.', mfc=MPL.blue, mec=MPL.blue, ecolor=MPL.blue,
+                capsize=0, ls='None', label="Fit 2D"
+            )
+        if bad.any():
+            ax1.plot(wavelengths[bad],
+                     self.metaslice_info[self.seeing_key][bad], marker='.',
+                     mfc=MPL.red, mec=MPL.red, ls='None', label="_")
+        ax1.plot(
+            wavelengths,
+            self.metaslice_info['guess_%s' % self.seeing_key],
+            'k--',
+            label="Guess 3D" if not self.seeing_prior else "Prior 3D"
+        )
+        fit_widths = extract_key(self.fitter_3d.scene_models, self.seeing_key)
+        plot_conf_interval(ax1, wavelengths, fit_widths, None)
+
+        seeing_powerlaw_guesses = []
+        seeing_powerlaw_values = []
+        for key in self.seeing_powerlaw_keys:
+            seeing_powerlaw_guesses.append(self.metaslice_guesses[key])
+            seeing_powerlaw_values.append(self.fit_parameters[key])
+
+        txt = 'Guess: %s' % \
+              (', '.join(['A%d=%.2f' % (i, a) for i, a in
+                          enumerate(seeing_powerlaw_guesses)]))
+        txt += '\nFit: %s' % \
+               (', '.join(['A%d=%.2f' % (i, a) for i, a in
+                           enumerate(seeing_powerlaw_values)]))
+
+        txtcol = 'k'
+        if self.accountant and self.accountant.test_warning('ES_PRIOR_SEEING'):
+            txt += '\n%s' % self.accountant.get_warning('ES_PRIOR_SEEING')
+            txtcol = MPL.red
+        ax1.text(0.95, 0.8, txt, transform=ax1.transAxes, fontsize='small',
+                 ha='right', color=txtcol)
+        ax1.legend(loc='upper left', fontsize='small', frameon=False)
+        plt.setp(ax1.get_yticklabels(), fontsize='x-small')
+
+        if good.any():
+            ax2.errorbar(wavelengths[good], val_2[good], err_2[good],
+                         marker='.', mfc=MPL.blue, mec=MPL.blue,
+                         ecolor=MPL.blue, capsize=0, ls='None')
+        if bad.any():
+            ax2.plot(wavelengths[bad], val_2[bad], marker='.', mfc=MPL.red,
+                     mec=MPL.red, ls='None')
+        ax2.plot(wavelengths, guess_2*np.ones(len(wavelengths)), 'k--')
+        plot_conf_interval(ax2, wavelengths, fit_2*np.ones(len(wavelengths)),
+                           fit_err_2*np.ones(len(wavelengths)))
+        txt = 'Guess: %s=%.3f' % (label_2, guess_2)
+        txt += '\nFit: %s=%.3f' % (label_2, fit_2)
+
+        ax2.text(0.95, 0.1, txt, transform=ax2.transAxes, fontsize='small',
+                 ha='right', va='bottom')
+        plt.setp(ax2.get_yticklabels(), fontsize='x-small')
+
+        if good.any():
+            ax3.errorbar(wavelengths[good], val_3[good], err_3[good],
+                         marker='.', mfc=MPL.blue, mec=MPL.blue,
+                         ecolor=MPL.blue, capsize=0, ls='None')
+        if bad.any():
+            ax3.plot(wavelengths[bad], val_3[bad], marker='.', mfc=MPL.red,
+                     mec=MPL.red, ls='None')
+        ax3.plot(wavelengths, guess_3*np.ones(len(wavelengths)), 'k--')
+        plot_conf_interval(ax3, wavelengths, fit_3*np.ones(len(wavelengths)),
+                           fit_err_3*np.ones(len(wavelengths)))
+        txt = 'Guess: %s=%.3f' % (label_3, guess_3)
+        txt += '\nFit: %s=%.3f' % (label_3, fit_3)
+        ax3.text(0.95, 0.1, txt, transform=ax3.transAxes, fontsize='small',
+                 ha='right', va='bottom')
+        plt.setp(ax3.get_xticklabels() + ax3.get_yticklabels(),
+                 fontsize='x-small')
+
+        fig.subplots_adjust(left=0.1, right=0.96, bottom=0.08, top=0.95)
+        if path:
+            fig.savefig(path)
+
+    def plot_residuals(self, path=None):
+        """Plot the residuals of the 3D fit in each meta-slice.
+
+        If path is set, the plot is written to a file at that path.
+        """
+        # Make sure that the 3D fit has already been done.
+        if self.fit_scene_model is None:
+            raise SceneModelException(
+                "Must run the 3D metaslice fit before plotting residuals!"
+            )
+
+        if path is not None:
+            self.print_message("Producing residual plot %s..." % path, 1)
+
+        import matplotlib
+        from matplotlib import pyplot as plt
+
+        fig = plt.figure()
+        fig.suptitle("Residual plot [%s, airmass=%.2f]" %
+                     (self.object_name, self.header['AIRMASS']),
+                     fontsize='large')
+
+        wavelengths = self.meta_cube.lbda
+        num_meta_slices = self.meta_cube.nslice
+        ncol = int(np.floor(np.sqrt(num_meta_slices)))
+        nrow = int(np.ceil(num_meta_slices / float(ncol)))
+
+        fit_center_x = self.metaslice_info['fit_center_x']
+        fit_center_y = self.metaslice_info['fit_center_y']
+
+        extent = (self.meta_cube.x.min() - 0.5, self.meta_cube.x.max() + 0.5,
+                  self.meta_cube.y.min() - 0.5, self.meta_cube.y.max() + 0.5)
+
+        images = []
+        for i in range(num_meta_slices):        # Loop over meta-slices
+            ax = fig.add_subplot(ncol, nrow, i + 1, aspect='equal')
+            data = self.meta_cube.slice2d(i, coord='p')  # Signal
+            fit = self.meta_cube_model.slice2d(i, coord='p')  # Model
+            if self.least_squares:
+                # Least-squares: display relative residuals
+                res = np.nan_to_num((data - fit) / fit) * 100  # [%]
+            else:
+                # Chi2 fit: display residuals in units of sigma
+                var = self.meta_cube.slice2d(i, coord='p', var=True, NAN=False)
+                res = np.nan_to_num((data - fit) / np.sqrt(var))
+
+            # List of images, to be commonly normalized latter on
+            images.append(ax.imshow(res, origin='lower', extent=extent,
+                                    cmap=plt.cm.RdBu_r,
+                                    interpolation='nearest'))
+
+            ax.plot((fit_center_x[i],), (fit_center_y[i],), marker='*',
+                    color=MPL.green)
+            plt.setp(ax.get_xticklabels() + ax.get_yticklabels(),
+                     fontsize='xx-small')
+            ax.text(0.05, 0.85, u"%.0f Å" % wavelengths[i],
+                    fontsize='x-small', transform=ax.transAxes)
+            ax.axis(extent)
+
+            # Axis management
+            if ax.is_last_row() and ax.is_first_col():
+                ax.set_xlabel("I [spx]", fontsize='small')
+                ax.set_ylabel("J [spx]", fontsize='small')
+            if not ax.is_last_row():
+                ax.xaxis.set_major_formatter(matplotlib.ticker.NullFormatter())
+            if not ax.is_first_col():
+                ax.yaxis.set_major_formatter(matplotlib.ticker.NullFormatter())
+
+        # Common image normalization
+        vmin, vmax = np.percentile(
+            [im.get_array().filled() for im in images], (3., 97.))
+        norm = matplotlib.colors.Normalize(vmin=vmin, vmax=vmax)
+        for im in images:
+            im.set_norm(norm)
+
+        # Colorbar
+        cax = fig.add_axes([0.90, 0.07, 0.02, 0.87])
+        cbar = fig.colorbar(images[0], cax, orientation='vertical')
+        plt.setp(cbar.ax.get_yticklabels(), fontsize='small')
+        if self.least_squares:
+            # Chi2 fit
+            cbar.set_label(u'Residuals [%]', fontsize='small')
+        else:
+            cbar.set_label(u'Residuals [σ]', fontsize='small')
+
+        fig.subplots_adjust(left=0.06, right=0.89, bottom=0.06, top=0.95,
+                            hspace=0.02, wspace=0.02)
+        if path:
+            fig.savefig(path)
+
+    def plot_radial_profile(self, path=None):
+        """Plot the radial profiles of the 3D fit in each meta-slice.
+
+        If path is set, the plot is written to a file at that path.
+        """
+        # Make sure that the 3D fit has already been done.
+        if self.fit_scene_model is None:
+            raise SceneModelException(
+                "Must run the 3D metaslice fit before plotting radial "
+                "profiles!"
+            )
+
+        if path is not None:
+            self.print_message("Producing radial profile plot %s..." % path, 1)
+
+        import matplotlib
+        from matplotlib import pyplot as plt
+
+        wavelengths = self.meta_cube.lbda
+        num_meta_slices = self.meta_cube.nslice
+        ncol = int(np.floor(np.sqrt(num_meta_slices)))
+        nrow = int(np.ceil(num_meta_slices / float(ncol)))
+
+        # 3D fit positions
+        fit_center_x = self.metaslice_info['fit_center_x']
+        fit_center_y = self.metaslice_info['fit_center_y']
+
+        fig = plt.figure()
+        fig.suptitle(
+            "Radial profile plot [%s, airmass=%.2f]" %
+            (self.object_name, self.header['AIRMASS']),
+            fontsize='large'
+        )
+
+        # Compute all of the model components on an incomplete cube. components
+        # will have the shape (num_meta_slices, num_components, num_spaxels)
+        full_components = self.fitter_3d.evaluate(separate_components=True)
+        components = full_components[..., self.meta_cube_model.i,
+                                     self.meta_cube_model.j]
+        num_components = components.shape[1]
+
+        def ellRadius(x, y, x0, y0, ell, xy):
+            dx = x - x0
+            dy = y - y0
+            # BEWARE: can return NaN's if ellipse is ill-defined
+            return np.sqrt(dx ** 2 + ell * dy ** 2 + 2 * xy * dx * dy)
+
+        def radialbin(r, f, binsize=20, weighted=True):
+            rbins = np.sort(r)[::binsize]  # Bin limits, starting from min(r)
+            ibins = np.digitize(r, rbins)  # WARNING: ibins(min(r)) = 1
+            ib = np.arange(len(rbins)) + 1  # Bin indices
+            ib = [iib for iib in ib if r[ibins == iib].any()]
+            # Mean radius
+            rb = np.array([r[ibins == iib].mean() for iib in ib])
+            if weighted:
+                # Mean radius-weighted data
+                fb = np.array(
+                    [np.average(f[ibins == iib], weights=r[ibins == iib]) for
+                     iib in ib]
+                )
+            else:
+                fb = np.array([f[ibins == iib].mean()
+                              for iib in ib])  # Mean data
+            return rb, fb
+
+        for i in range(num_meta_slices):        # Loop over slices
+            ax = fig.add_subplot(nrow, ncol, i + 1, yscale='log')
+            # Use adjusted elliptical radius instead of plain radius
+            # r    = np.hypot(meta_cube.x-xfit[i], meta_cube.y-yfit[i])
+            # rfit = np.hypot(cube_fit.x-xfit[i], cube_fit.y-yfit[i])
+            if self.psf == 'classic':
+                r = ellRadius(
+                    self.meta_cube.x, self.meta_cube.y, fit_center_x[i],
+                    fit_center_y[i], self.fit_parameters['ell'],
+                    self.fit_parameters['xy']
+                )
+                rfit = ellRadius(
+                    self.meta_cube_model.x, self.meta_cube_model.y,
+                    fit_center_x[i], fit_center_y[i],
+                    self.fit_parameters['ell'], self.fit_parameters['xy']
+                )
+            else:
+                r = np.hypot(self.meta_cube.x - fit_center_x[i],
+                             self.meta_cube.y - fit_center_y[i])
+                rfit = np.hypot(self.meta_cube_model.x - fit_center_x[i],
+                                self.meta_cube_model.y - fit_center_y[i])
+
+            ax.plot(r, self.meta_cube.data[i],
+                    marker=',', mfc=MPL.blue, mec=MPL.blue, ls='None')
+            ax.plot(rfit, self.meta_cube_model.data[i],
+                    marker='.', mfc=MPL.red, mec=MPL.red, ms=1, ls='None')
+            if self.has_sky and self.sky_spectrum.data.any():
+                colors = [MPL.green, MPL.orange, MPL.purple, MPL.yellow,
+                          MPL.brown]
+                for component_idx in range(num_components):
+                    color = colors[component_idx % len(colors)]
+                    ax.plot(rfit, components[i][component_idx], mfc=color,
+                            mec=color, ms=1, ls='None')
+            plt.setp(ax.get_xticklabels() + ax.get_yticklabels(),
+                     fontsize='xx-small')
+            ax.text(0.05, 0.85, u"%.0f Å" % wavelengths[i],
+                    fontsize='x-small', transform=ax.transAxes)
+            if ax.is_last_row() and ax.is_first_col():
+                ax.set_xlabel("Elliptical radius [spx]", fontsize='small')
+                ax.set_ylabel("Flux", fontsize='small')
+            ax.axis([0, rfit.max() * 1.1,
+                     self.meta_cube_model.data[i].min() / 2,
+                     self.meta_cube_model.data[i].max() * 2])
+
+            # Binned values
+            rb, db = radialbin(r, self.meta_cube.data[i])
+            ax.plot(rb, db, 'c.')
+            rfb, fb = radialbin(rfit, self.meta_cube_model.data[i])
+            ax.plot(rfb, fb, 'm.')
+
+        fig.subplots_adjust(left=0.07, right=0.96, bottom=0.06, top=0.94)
+        if path:
+            fig.savefig(path)
+
+    def plot_contours(self, path=None):
+        """Plot contours of each meta-slice and its 3D fit.
+
+        If path is set, the plot is written to a file at that path.
+        """
+        # Make sure that the 3D fit has already been done.
+        if self.fit_scene_model is None:
+            raise SceneModelException(
+                "Must run the 3D metaslice fit before plotting radial "
+                "profiles!"
+            )
+
+        if path is not None:
+            self.print_message("Producing contour plot %s..." % path, 1)
+
+        import matplotlib
+        from matplotlib import pyplot as plt
+
+        # Accomodate errorbar fmt API change at v2.2.0
+        # (https://matplotlib.org/api/api_changes.html#function-signatures)
+        if matplotlib.__version__ >= '2.2.0':
+            NONE = 'none'
+        else:
+            NONE = None
+
+        wavelengths = self.meta_cube.lbda
+        num_meta_slices = self.meta_cube.nslice
+        ncol = int(np.floor(np.sqrt(num_meta_slices)))
+        nrow = int(np.ceil(num_meta_slices / float(ncol)))
+
+        # Retrieve positions from individual fits
+        individual_x = self.metaslice_info['center_x']
+        individual_y = self.metaslice_info['center_y']
+        individual_x_err = self.metaslice_info['center_x_uncertainty']
+        individual_y_err = self.metaslice_info['center_y_uncertainty']
+
+        # 3D fit positions
+        fit_center_x = self.metaslice_info['fit_center_x']
+        fit_center_y = self.metaslice_info['fit_center_y']
+
+        valid = self.metaslice_info['valid']
+        good = self.metaslice_info['good']
+
+        fig = plt.figure()
+        fig.suptitle(
+            "Data and fit [%s, airmass=%.2f]" %
+            (self.object_name, self.header['AIRMASS']),
+            fontsize='large'
+        )
+
+        extent = (self.meta_cube.x.min() - 0.5, self.meta_cube.x.max() + 0.5,
+                  self.meta_cube.y.min() - 0.5, self.meta_cube.y.max() + 0.5)
+
+        for i in range(num_meta_slices):        # Loop over meta-slices
+            ax = fig.add_subplot(ncol, nrow, i + 1, aspect='equal')
+            data = self.meta_cube.slice2d(i, coord='p')
+            good_data = data[np.isfinite(data)]
+            fit = self.meta_cube_model.slice2d(i, coord='p')
+
+            vmin, vmax = np.percentile(good_data[good_data > 0], (5., 95.))
+            lev = np.logspace(np.log10(vmin), np.log10(vmax), 5)
+            ax.contour(data, lev, origin='lower', extent=extent,
+                       cmap=matplotlib.cm.jet)                          # Data
+            ax.contour(fit, lev, origin='lower', extent=extent,
+                       linestyles='dashed', cmap=matplotlib.cm.jet)     # Fit
+            if valid[i]:
+                ax.errorbar((individual_x[i],), (individual_y[i],),
+                            xerr=(individual_x_err[i],),
+                            yerr=(individual_y_err[i],), fmt=NONE,
+                            ecolor=MPL.blue if good[i] else MPL.red)
+            ax.plot((fit_center_x[i],), (fit_center_y[i],), marker='*',
+                    color=MPL.green)
+            plt.setp(ax.get_xticklabels() + ax.get_yticklabels(),
+                     fontsize='xx-small')
+            ax.text(0.05, 0.85, u"%.0f Å" % wavelengths[i], fontsize='x-small',
+                    transform=ax.transAxes)
+            ax.axis(extent)
+            if ax.is_last_row() and ax.is_first_col():
+                ax.set_xlabel("I [spx]", fontsize='small')
+                ax.set_ylabel("J [spx]", fontsize='small')
+            if not ax.is_last_row():
+                plt.setp(ax.get_xticklabels(), visible=False)
+            if not ax.is_first_col():
+                plt.setp(ax.get_yticklabels(), visible=False)
+
+        fig.subplots_adjust(left=0.05, right=0.96, bottom=0.06, top=0.95,
+                            hspace=0.02, wspace=0.02)
+        if path:
+            fig.savefig(path)

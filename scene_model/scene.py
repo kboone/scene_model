@@ -841,7 +841,6 @@ class SceneModel(object):
         )
 
         if not res.success:
-            print(res)
             raise SceneModelException("Fit failed!", res.message)
 
         # Retrieve the unscaled parameters.
@@ -850,10 +849,11 @@ class SceneModel(object):
             fit_parameters, return_full_info=True, apply_fit_scale=False,
             apply_priors=False,
         )
+
+        self.set_parameters(update_derived=False, **full_parameters)
         prior_penalty = self._evaluate_priors()
 
         # Save the fit results.
-        self.set_parameters(update_derived=False, **full_parameters)
         self.fit_model = full_model
         self.fit_result = res
         self.fit_chi_square = chi_square
@@ -886,7 +886,7 @@ class SceneModel(object):
 
             return self.chi_square(
                 map_parameters, do_analytic_coefficients=False,
-                apply_fit_scale=True
+                apply_fit_scale=True, apply_priors=True
             )
 
         cov = fit.calculate_covariance(evaluate_chi_square, method,

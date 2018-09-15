@@ -898,6 +898,7 @@ class MultipleImageFitter():
                 do_analytic_coefficients=False,
                 save_parameters=save_parameters,
                 apply_fit_scale=True,
+                apply_priors=True,
             )
 
         cov = calculate_covariance(chi_square_flat, method, parameter_names,
