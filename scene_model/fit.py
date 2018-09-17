@@ -868,7 +868,6 @@ class MultipleImageFitter():
     def fit_and_fix_positions(self, **kwargs):
         """Fit the positions of each scene with a Gaussian, and fix them for
         future fits"""
-        print("TODO: make this work!")
         for scene_model in self.scene_models:
             scene_model.fit_and_fix_position(**kwargs)
 

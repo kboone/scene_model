@@ -149,6 +149,7 @@ if __name__ == "__main__":
             border=opts.border,
             least_squares=opts.least_squares,
             prior_scale=opts.usePriors,
+            seeing_prior=opts.seeingPrior,
             accountant=accountant,
             verbosity=opts.verbosity
         )

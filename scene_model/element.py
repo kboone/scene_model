@@ -341,6 +341,8 @@ class ModelElement(object):
         dictionary of updated parameters that includes both derived parameters
         and internal ones.
         """
+        original_coefficient_values = {}
+
         # Add in base parameters
         for key, parameter_dict in self._parameter_info.items():
             if key not in parameters:
@@ -348,8 +350,13 @@ class ModelElement(object):
 
             if not apply_coefficients:
                 # Don't apply coefficients to the model. This means that the
-                # scales of the components should be set to 1.
+                # scales of the components should not be set. We temporarily
+                # set them to 1 so that the model can be evaluated
+                # transparently, and we then then unset them at the end of this
+                # method.
                 if parameter_dict['coefficient']:
+                    original_value = parameters.get(key, None)
+                    original_coefficient_values[key] = original_value
                     parameters[key] = 1.
 
         # Update the derived parameters. We use a ModelParameterDictionary
@@ -371,6 +378,12 @@ class ModelElement(object):
 
         # Get the full unmapped parameters to return
         scene_parameters = full_parameters.model_dict
+
+        # Set the coefficients back to their original values if we aren't
+        # applying them to the model.
+        if not apply_coefficients:
+            for key, value in original_coefficient_values.items():
+                scene_parameters[key] = value
 
         return model, mode, scene_parameters
 

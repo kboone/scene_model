@@ -708,6 +708,7 @@ class SceneModel(object):
                     value = parameters[parameter_name]
                 else:
                     value = parameter_dict['value']
+                value = parameter_dict['value']
                 model += mask_component * value
             else:
                 # Need to fit this parameter, add it to the basis
@@ -1380,3 +1381,28 @@ class SceneModel(object):
             plt.ylim(min_val / 5., np.max(plot_data)*2)
 
         plt.legend()
+
+    def fit_and_fix_position(self, verbose=False, center_x_key='center_x',
+                             center_y_key='center_y', border=0, subsampling=5,
+                             **kwargs):
+        """Fit the object in the image with a Gaussian, and fix its position
+        for future fits.
+
+        As the position is typically easy to fit on high signal-to-noise
+        images, this is useful to speed up fits to large datasets since the
+        position fit doesn't affect anything else.
+
+        Note that we use the GaussianSceneModel class which evaluates in real
+        space. This means that we don't need a border on the model, but we do
+        need higher subsampling to get a good result.
+        """
+        from .models import GaussianSceneModel
+        gaussian_model = GaussianSceneModel(
+            self.image, self.variance, border=border, subsampling=subsampling,
+            **kwargs
+        )
+        parameters, model = gaussian_model.fit(verbose=verbose)
+        center_x = parameters['center_x']
+        center_y = parameters['center_y']
+
+        self.fix(center_x=center_x, center_y=center_y)

@@ -142,9 +142,9 @@ class PolynomialBackground(PixelModelComponent):
 
 class GaussianPsfElement(PsfElement):
     def _setup_parameters(self):
-        self._add_parameter('sigma_x', 1., (0.1, 20.), 'SIGX',
+        self._add_parameter('sigma_x', 1., (0.01, 20.), 'SIGX',
                             'Gaussian width in X direction')
-        self._add_parameter('sigma_y', 1., (0.1, 20.), 'SIGY',
+        self._add_parameter('sigma_y', 1., (0.01, 20.), 'SIGY',
                             'Gaussian width in Y direction')
         self._add_parameter('rho', 0., (-1., 1.), 'RHO',
                             'Gaussian correlation')
