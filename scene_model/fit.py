@@ -737,7 +737,7 @@ class MultipleImageFitter():
             bounds=bounds,
             jac=grad(chi_square_flat) if config.use_autograd else None,
             method='L-BFGS-B',
-            options={'maxiter': 400, 'ftol': 1e-12},
+            options={'maxiter': 400, 'ftol': 1e-10},
         )
 
         if not res.success:
@@ -979,7 +979,8 @@ class MultipleImageFitter():
         fit.
         """
         global_parameters, individual_parameters = \
-            self._get_fit_parameters(do_analytic_coefficients=False)
+            self._get_fit_parameters(do_analytic_coefficients=False,
+                                     apply_fit_scale=False)
 
         parameters = {}
 

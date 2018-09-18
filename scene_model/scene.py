@@ -784,11 +784,14 @@ class SceneModel(object):
             fit_scale = 1.
 
         for parameter_name, parameter_dict in self._parameter_info.items():
-            if (parameter_dict['fixed'] or parameter_dict['derived'] or
-                    (parameter_dict['coefficient'] and
-                     do_analytic_coefficients)):
-                # Parameter that isn't fitted, ignore it.
-                continue
+            try:
+                if (parameter_dict['fixed'] or parameter_dict['derived'] or
+                        (parameter_dict['coefficient'] and
+                         do_analytic_coefficients)):
+                    # Parameter that isn't fitted, ignore it.
+                    continue
+            except:
+                from IPython import embed; embed()
 
             new_dict = parameter_dict.copy()
 
@@ -838,11 +841,14 @@ class SceneModel(object):
             bounds=bounds,
             jac=grad(chi_square_flat) if config.use_autograd else None,
             method='L-BFGS-B',
-            options={'maxiter': 400, 'ftol': 1e-12},
+            options={'maxiter': 400, 'ftol': 1e-10},
         )
 
         if not res.success:
-            raise SceneModelException("Fit failed!", res.message)
+            raise SceneModelException(
+                "Fit failed! (message=%s, params=%s)" %
+                (res.message, dict(zip(parameter_names, res.x)))
+            )
 
         # Retrieve the unscaled parameters.
         fit_parameters = res.x * scales
@@ -1383,7 +1389,7 @@ class SceneModel(object):
         plt.legend()
 
     def fit_and_fix_position(self, verbose=False, center_x_key='center_x',
-                             center_y_key='center_y', border=0, subsampling=5,
+                             center_y_key='center_y', border=0, subsampling=3,
                              **kwargs):
         """Fit the object in the image with a Gaussian, and fix its position
         for future fits.
@@ -1396,11 +1402,12 @@ class SceneModel(object):
         space. This means that we don't need a border on the model, but we do
         need higher subsampling to get a good result.
         """
-        from .models import GaussianSceneModel
-        gaussian_model = GaussianSceneModel(
+        from .models import SimpleGaussianSceneModel
+        gaussian_model = SimpleGaussianSceneModel(
             self.image, self.variance, border=border, subsampling=subsampling,
             **kwargs
         )
+
         parameters, model = gaussian_model.fit(verbose=verbose)
         center_x = parameters['center_x']
         center_y = parameters['center_y']

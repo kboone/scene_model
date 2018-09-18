@@ -68,6 +68,34 @@ class GaussianPointSource(SubsampledModelComponent):
         return gaussian
 
 
+class SimpleGaussianPointSource(GaussianPointSource):
+    """A Gaussian point source with no ellipticity.
+
+    See GaussianPointSource for details. We fix rho to 0, and force sigma_x to
+    be equal to sigma_y, removing 2 parameters from the fit.
+    """
+    def _setup_parameters(self):
+        super(SimpleGaussianPointSource, self)._setup_parameters()
+
+        # sigma_y and sigma_x are now just one sigma parameter.
+        self._add_parameter('sigma', 1., (0.1, 20.), 'SIG', 'Gaussian width')
+        self._modify_parameter('sigma_x', derived=True)
+        self._modify_parameter('sigma_y', derived=True)
+        self.fix(rho=0)
+
+    def _calculate_derived_parameters(self, parameters):
+        p = parameters
+
+        p['sigma_x'] = p['sigma']
+        p['sigma_y'] = p['sigma']
+
+        # Update parameters from the superclass
+        parent_parameters = super(SimpleGaussianPointSource, self).\
+            _calculate_derived_parameters(p)
+
+        return parent_parameters
+
+
 class Background(PixelModelComponent):
     def _setup_parameters(self):
         self._add_parameter('background', None, (None, None), 'BKG',
@@ -217,6 +245,7 @@ class ExponentialPowerPsfElement(PsfElement):
                           **kwargs):
         k = np.sqrt(kx*kx + ky*ky)
 
+        # fourier_profile = np.exp(-width**power * k**power)
         fourier_profile = np.exp(-width**power * k**power)
 
         return fourier_profile
@@ -296,6 +325,23 @@ class GaussianSceneModel(SceneModel):
         ]
 
         super(GaussianSceneModel, self).__init__(elements, *args, **kwargs)
+
+
+class SimpleGaussianSceneModel(SceneModel):
+    """A scene model of a point source convolved with a Gaussian without
+    ellipticity.
+
+    See GaussianSceneModel for details.
+    """
+    def __init__(self, *args, **kwargs):
+        elements = [
+            SimpleGaussianPointSource,
+            RealPixelizer,
+            Background
+        ]
+
+        super(SimpleGaussianSceneModel, self).__init__(elements, *args,
+                                                       **kwargs)
 
 
 class KolmogorovSceneModel(SceneModel):
