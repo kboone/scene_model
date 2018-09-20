@@ -308,8 +308,7 @@ def get_background_element(background_degree):
 
 
 class SnifsAdrElement(ConvolutionElement):
-    """A PsfElement that applies atmospheric differential refraction to a
-    scene.
+    """An element that applies atmospheric differential refraction to a scene.
     """
     def __init__(self, adr_model=None, spaxel_size=None, pressure=None,
                  temperature=None, **kwargs):
@@ -564,6 +563,57 @@ class TrackingEllipticityPsfElement(PsfElement):
         return gaussian
 
 
+class SnifsClassicSeeingPrior(MultivariateGaussianPrior):
+    """Add a prior on the seeing of this image to the model.
+
+    This was adapted from libExtractStar.py. This only works when seeing_degree
+    is 2.
+    """
+    def __init__(self, channel, seeing, **kwargs):
+        # Predict the alpha parameters given a seeing value and a channel.
+        if channel == 'B':
+            central_values = np.array([
+                -0.134 * seeing + 0.5720,       # p0
+                -0.134 * seeing - 0.0913,       # p1
+                +3.474 * seeing - 1.3880        # p2
+            ])
+            covariance = np.array([
+                [0.0402503, 0.01114101, -0.0031652],
+                [0.01114101, 0.00722763, -0.00232724],
+                [-0.0031652, -0.00232724, 0.07978374]
+            ])
+        elif channel == 'R':
+            central_values = np.array([
+                -0.0777 * seeing + 0.1741,      # p0
+                -0.0202 * seeing - 0.3434,      # p1
+                +3.4000 * seeing - 1.352        # p2
+            ])
+            covariance = np.array([
+                [2.32247418e-03, 1.36444214e-05, -4.67068339e-03],
+                [1.36444214e-05, 1.66489725e-03, -1.69993230e-03],
+                [-4.67068377e-03, -1.69993216e-03, 9.80626270e-02]
+            ])
+        else:
+            raise SceneModelException("Unknown channel '%s'" % channel)
+
+        keys = ['A0', 'A1', 'A2']
+
+        super(SnifsClassicSeeingPrior, self).__init__(
+            keys, central_values, covariance, **kwargs
+        )
+
+    @classmethod
+    def from_fits_header(cls, header, seeing, **kwargs):
+        """Load the prior from a SNIFS fits header.
+
+        seeing should be a GS seeing prediction from SNIFS.
+        """
+        channel = header['CHANNEL']
+        prior = cls(channel, channel, seeing, **kwargs)
+
+        return prior
+
+
 class SnifsClassicEllipticityPrior(MultivariateGaussianPrior):
     """Add a prior on the ellipticity to a classic SNIFS model.
 
@@ -605,7 +655,7 @@ class SnifsClassicEllipticityPrior(MultivariateGaussianPrior):
         return prior
 
 
-class SnifsFourierSeeingPrior(GaussianPrior):
+class SnifsFourierSeeingPrior(MultivariateGaussianPrior):
     """Add a prior on the seeing of this image to the model.
 
     The seeing_width parameter sets the seeing of the model. The relationship
@@ -613,13 +663,58 @@ class SnifsFourierSeeingPrior(GaussianPrior):
     was measured from a large set of extractions of standard stars on all
     photometric nights.
     """
-    def __init__(self, seeing, seeing_key='seeing_width', **kwargs):
-        predicted_width = -0.342 + 0.914 * seeing
-        dispersion = 0.079
+    def __init__(self, channel, exposure_time, seeing, **kwargs):
+        # Seeing prediction. This is the conversion between the GS seeing value
+        # to the width of the model. I fit a linear relation to all of the
+        # long exposure standard star exposures (short exposures don't have a
+        # GS seeing prediction). There is no noticeable difference between the
+        # channels or exposure times.
+        predicted_width = -0.378 + 0.895 * seeing
+        dispersion_width = 0.0727
+
+        # Power prediction. The value here depends on whether it was a long or
+        # short exposure and the channel. I grouped everything into short
+        # (<1.5s), intermediate (1.5s to 15s) and long (>15s) exposures and
+        # estimated from that. I realized afterwards that only long exposures
+        # have a seeing estimate and therefore a prior applied. This could in
+        # principle be pulled out so that the power prior is always applied,
+        # but that isn't the case right now.
+        if exposure_time < 1.5:
+            if channel == 'B':
+                predicted_power, dispersion_power = (-0.497, 0.103)
+            elif channel == 'R':
+                predicted_power, dispersion_power = (-0.498, 0.141)
+        elif exposure_time < 15.:
+            if channel == 'B':
+                predicted_power, dispersion_power = (-0.432, 0.165)
+            elif channel == 'R':
+                predicted_power, dispersion_power = (-0.418, 0.187)
+        else:
+            if channel == 'B':
+                predicted_power, dispersion_power = (-0.394, 0.068)
+            elif channel == 'R':
+                predicted_power, dispersion_power = (-0.334, 0.089)
+
+        # Seeing powerlaw power
+        keys = ['seeing_ref_width', 'seeing_ref_power']
+        central_values = [predicted_width, predicted_power]
+        covariance = [[dispersion_width**2, 0], [0, dispersion_power**2]]
 
         super(SnifsFourierSeeingPrior, self).__init__(
-            seeing_key, predicted_width, dispersion, **kwargs
+            keys, central_values, covariance, **kwargs
         )
+
+    @classmethod
+    def from_fits_header(cls, header, seeing, **kwargs):
+        """Load the prior from a SNIFS fits header.
+
+        seeing should be a GS seeing prediction from SNIFS.
+        """
+        channel = header['CHANNEL']
+        efftime = header['EFFTIME']
+        prior = cls(channel, efftime, seeing, **kwargs)
+
+        return prior
 
 
 class SnifsFourierEllipticityPrior(MultivariateGaussianPrior):
@@ -1110,9 +1205,21 @@ class SnifsCubeFitter(object):
             individual_priors.append(ell_prior)
             global_priors.append(ell_prior)
 
+            # Seeing prior is applied only for global fits if seeing_prior is
+            # set.
+            if seeing_prior is not None:
+                if psf == "fourier":
+                    seeing_prior_object = SnifsFourierSeeingPrior.\
+                        from_fits_header(self.header, seeing_prior)
+                elif psf == "classic":
+                    seeing_prior_object = SnifsClassicSeeingPrior.\
+                        from_fits_header(self.header, seeing_prior)
+                global_priors.append(seeing_prior_object)
+
         self.psf = psf
         self.prior_scale = prior_scale
         self.seeing_prior = seeing_prior
+        self.seeing_prior_object = seeing_prior_object
         self.individual_priors = individual_priors
         self.global_priors = global_priors
         self.scene_model_class = scene_model_class
@@ -1250,7 +1357,6 @@ class SnifsCubeFitter(object):
                 individual_scene_models.append(None)
                 individual_uncertainties.append(None)
                 valid.append(False)
-                raise
 
         valid = np.array(valid)
         if not np.all(valid):
@@ -1291,15 +1397,22 @@ class SnifsCubeFitter(object):
             print("  WARNING: %d metaslices discarded after ADR selection" %
                   (len(np.nonzero(bad))))
 
-        # Estimate the seeing coefficients
+        # Estimate the seeing coefficients. If we have a prior on the seeing
+        # use that. If not, do a fit to the 2D slices.
         seeing_widths = extract_key(individual_scene_models, self.seeing_key)
         seeing_uncertainties = extract_key(individual_uncertainties,
                                            self.seeing_key)
-        seeing_powerlaw_guesses = fit_power_law(
-            meta_cube.lbda[good] / config.reference_wavelength,
-            seeing_widths[good],
-            self.seeing_degree
-        )
+        if self.prior_scale > 0. and self.seeing_prior:
+            prior_predictions = self.seeing_prior_object.predicted_values
+            seeing_powerlaw_guesses = [
+                prior_predictions[i] for i in self.seeing_powerlaw_keys
+            ]
+        else:
+            seeing_powerlaw_guesses = fit_power_law(
+                meta_cube.lbda[good] / config.reference_wavelength,
+                seeing_widths[good],
+                self.seeing_degree
+            )
         guess_seeing_widths = evaluate_power_law(
             seeing_powerlaw_guesses,
             meta_cube.lbda / config.reference_wavelength
@@ -1355,6 +1468,11 @@ class SnifsCubeFitter(object):
             guess_value = np.median(values[good])
             metaslice_guesses[key] = guess_value
 
+        # For variables that we have priors on, override any guesses from the
+        # data.
+        for prior in self.global_priors:
+            prior.update_initial_values(metaslice_guesses)
+
         # Save results
         self.meta_cube = meta_cube
         self.metaslice_info = metaslice_info
@@ -1371,20 +1489,19 @@ class SnifsCubeFitter(object):
         logfile.write('# airmass : %.3f \n' % self.header["AIRMASS"])
         logfile.write('# efftime : %.3f \n' % self.header["EFFTIME"])
 
-        failed_fits = []
-
         first = True
         for row in self.metaslice_info:
+            wavelength = row['wavelength']
+            valid = row['valid']
+            if not valid:
+                # Fit failed, skip
+                logfile.write("# Fit failed for wavelength %.2f" % wavelength)
+                continue
+
             scene_model = row['scene_model']
             parameters = scene_model.parameters
             parameter_names = sorted(parameters.keys())
             uncertainties = row['uncertainties']
-            wavelength = row['wavelength']
-            valid = row['valid']
-
-            if not valid:
-                # Fit failed, skip
-                logfile.write("# Fit failed for wavelength %.2f" % wavelength)
 
             if first:
                 # Print a header.
@@ -1778,12 +1895,12 @@ class SnifsCubeFitter(object):
                                       'Seeing prior [arcsec]')
 
         # Save the point source spectrum
-        print("Saving output point-source spectrum to '%s'" % output_path)
+        print("  Saving output point-source spectrum to '%s'" % output_path)
         write_pysnifs_spectrum(self.point_source_spectrum, output_path, header)
 
         if self.has_sky:
             # Save the sky spectrum
-            print("Saving output sky spectrum to '%s'" % sky_output_path)
+            print("  Saving output sky spectrum to '%s'" % sky_output_path)
             write_pysnifs_spectrum(self.sky_spectrum, sky_output_path, header)
 
     @property
@@ -2169,19 +2286,19 @@ class SnifsCubeFitter(object):
         if path:
             fig.savefig(path)
 
-    def plot_ellipticity(self, path=None):
-        """Plot the ellipticity parameters
+    def plot_seeing(self, path=None):
+        """Plot the seeing and ellipticity parameters
 
         If path is set, the plot is written to a file at that path.
         """
         # Make sure that the 3D fit has already been done.
         if self.fit_scene_model is None:
             raise SceneModelException(
-                "Must run the 3D metaslice fit before plotting ellipticity!"
+                "Must run the 3D metaslice fit before plotting seeing!"
             )
 
         if path is not None:
-            self.print_message("Producing ellipticity plot %s..." % path, 1)
+            self.print_message("Producing seeing plot %s..." % path, 1)
 
         import matplotlib
         from matplotlib import pyplot as plt
@@ -2201,7 +2318,7 @@ class SnifsCubeFitter(object):
             label_2 = 'ellipticity x'
             label_3 = 'ellipticity y'
         else:
-            raise SceneModelException("Can't make ellipticity plot for PSF %s"
+            raise SceneModelException("Can't make seeing plot for PSF %s"
                                       % self.psf)
 
         wavelengths = self.meta_cube.lbda

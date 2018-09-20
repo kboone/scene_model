@@ -480,8 +480,7 @@ class MultipleImageFitter():
         if priors:
             parameters = self.parameters
             for prior in self.priors:
-                if prior.set_initial_values:
-                    parameters = prior.update_initial_values(self, parameters)
+                parameters = prior.update_initial_values(parameters)
             self.set_parameters(update_derived=False, **parameters)
 
         self.fit_result = None

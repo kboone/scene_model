@@ -32,16 +32,31 @@ class Prior(object):
         """
         self.set_initial_values = set_initial_values
 
-    def update_initial_values(self, instance, parameters):
-        """Update the parameters dictionary and return it.
+    @property
+    def predicted_values(self):
+        """Return a dictionary of values that are predicted by the prior.
 
-        instance is the object that the prior is associated to. This can be
-        used to pull out whatever further information is necessary to get the
-        initial values.
+        This is primarily used for setting initial guesses, and should be
+        implemented by subclasses.
+        """
+        return {}
+
+    def update_initial_values(self, parameters):
+        """Update the parameters dictionary and return it.
 
         It is fine for this function to edit the parameters dictionary in
         place, but it still must return the dictionary.
+
+        By default, this pulls a list of predicted values from
+        Prior.predicted_values and adds them in, so only that function needs to
+        be overridden.
         """
+        if not self.set_initial_values:
+            # Skip setting initial values.
+            return parameters
+
+        parameters.update(self.predicted_values)
+
         return parameters
 
     def evaluate(self, parameters):
@@ -61,10 +76,9 @@ class GaussianPrior(Prior):
         self.central_value = central_value
         self.sigma = sigma
 
-    def update_initial_values(self, instance, parameters):
-        parameters[self.parameter_name] = self.central_value
-
-        return parameters
+    @property
+    def predicted_values(self):
+        return {self.parameter_name: self.central_value}
 
     def evaluate(self, parameters):
         """Evaluate a Gaussian prior"""
@@ -90,12 +104,14 @@ class MultivariateGaussianPrior(Prior):
 
         self.inv_covariance = pinvh(covariance)
 
-    def update_initial_values(self, instance, parameters):
+    @property
+    def predicted_values(self):
+        result = {}
         for parameter_name, central_value in zip(self.parameter_names,
                                                  self.central_values):
-            parameters[parameter_name] = central_value
+            result[parameter_name] = central_value
 
-        return parameters
+        return result
 
     def evaluate(self, parameters):
         """Evaluate a Multivariate Gaussian prior.

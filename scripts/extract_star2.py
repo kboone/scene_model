@@ -130,6 +130,7 @@ if __name__ == "__main__":
             from libRecord import Accountant
         except ImportError:
             print("WARNING: libRecord is not accessible, accounting disabled")
+            accountant = None
         else:
             import atexit
 
@@ -206,7 +207,6 @@ if __name__ == "__main__":
             basename = os.path.splitext(opts.out)[0]
         except KeyError:
             opts.graph = 'pylab'
-            plot1 = plot2 = plot3 = plot4 = plot5 = plot6 = plot7 = plot8 = ''
 
         def make_plot_path(extension):
             if opts.graph == 'pylab':
@@ -221,6 +221,6 @@ if __name__ == "__main__":
         fitter.plot_row_column_sums(make_plot_path("_fit2"))
         fitter.plot_adr(make_plot_path("_fit3"))
         fitter.plot_residuals(make_plot_path("_fit4"))
-        fitter.plot_ellipticity(make_plot_path("_fit5"))
+        fitter.plot_seeing(make_plot_path("_fit5"))
         fitter.plot_radial_profile(make_plot_path("_fit6"))
         fitter.plot_contours(make_plot_path("_fit7"))
