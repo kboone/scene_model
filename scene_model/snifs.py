@@ -388,8 +388,9 @@ class SnifsAdrElement(ConvolutionElement):
                 "Must specify all of pressure, temperature and spaxel_size."
             )
 
-        adr_model = build_adr_model(pressure, temperature, delta=self['delta'],
-                                    theta=self['theta'])
+        adr_model = build_adr_model(pressure, temperature,
+                                    delta=self['adr_delta'],
+                                    theta=self['adr_theta'])
 
         self.adr_model = adr_model
         self.spaxel_size = spaxel_size
@@ -1215,11 +1216,11 @@ class SnifsCubeFitter(object):
                     seeing_prior_object = SnifsClassicSeeingPrior.\
                         from_fits_header(self.header, seeing_prior)
                 global_priors.append(seeing_prior_object)
+                self.seeing_prior_object = seeing_prior_object
 
         self.psf = psf
         self.prior_scale = prior_scale
         self.seeing_prior = seeing_prior
-        self.seeing_prior_object = seeing_prior_object
         self.individual_priors = individual_priors
         self.global_priors = global_priors
         self.scene_model_class = scene_model_class
@@ -1865,6 +1866,7 @@ class SnifsCubeFitter(object):
         header[p('VERS')] = config.__version__
         header[p('CUBE')] = (self.path, "Input cube")
         header[p('LREF')] = (config.reference_wavelength, "Lambda ref. [A]")
+        header[p('SDEG')] = (self.background_degree, "Polynomial bkgnd degree")
         header[p('CHI2')] = (self.fitter_3d.fit_chi_square,
                              "Chi2|RSS of 3D-fit")
         header[p('AIRM')] = (self.adr_model.get_airmass(), "Effective airmass")
