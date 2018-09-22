@@ -2499,9 +2499,10 @@ class SnifsCubeFitter(object):
             seeing_powerlaw_guesses.append(self.metaslice_guesses[key])
             seeing_powerlaw_values.append(self.fit_parameters[key])
 
-        txt = 'Guess: %s' % \
-              (', '.join(['A%d=%.2f' % (i, a) for i, a in
-                          enumerate(seeing_powerlaw_guesses)]))
+        guess_label = 'Prior' if self.prior_scale > 0 else 'Guess'
+        txt = '%s: %s' % (guess_label,
+                          (', '.join(['A%d=%.2f' % (i, a) for i, a in
+                                      enumerate(seeing_powerlaw_guesses)])))
         txt += '\nFit: %s' % \
                (', '.join(['A%d=%.2f' % (i, a) for i, a in
                            enumerate(seeing_powerlaw_values)]))
@@ -2525,7 +2526,7 @@ class SnifsCubeFitter(object):
         ax2.plot(wavelengths, guess_2*np.ones(len(wavelengths)), 'k--')
         plot_conf_interval(ax2, wavelengths, fit_2*np.ones(len(wavelengths)),
                            fit_err_2*np.ones(len(wavelengths)))
-        txt = 'Guess: %s=%.3f' % (label_2, guess_2)
+        txt = '%s: %s=%.3f' % (guess_label, label_2, guess_2)
         txt += '\nFit: %s=%.3f' % (label_2, fit_2)
 
         ax2.text(0.95, 0.1, txt, transform=ax2.transAxes, fontsize='small',
@@ -2542,7 +2543,7 @@ class SnifsCubeFitter(object):
         ax3.plot(wavelengths, guess_3*np.ones(len(wavelengths)), 'k--')
         plot_conf_interval(ax3, wavelengths, fit_3*np.ones(len(wavelengths)),
                            fit_err_3*np.ones(len(wavelengths)))
-        txt = 'Guess: %s=%.3f' % (label_3, guess_3)
+        txt = '%s: %s=%.3f' % (guess_label, label_3, guess_3)
         txt += '\nFit: %s=%.3f' % (label_3, fit_3)
         ax3.text(0.95, 0.1, txt, transform=ax3.transAxes, fontsize='small',
                  ha='right', va='bottom')
