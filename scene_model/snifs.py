@@ -2217,6 +2217,9 @@ class SnifsCubeFitter(object):
 
             fig.subplots_adjust(left=0.06, right=0.96, bottom=0.06, top=0.95)
 
+        if path:
+            fig.savefig(path)
+
     def plot_adr(self, path=None):
         """Plot the ADR fit
 
