@@ -60,6 +60,14 @@ if __name__ == "__main__":
                       help="Border used for model evaluation [%default]",
                       default=scene_model.config.default_border)
 
+    parser.add_option("-m", "--method",
+                      choices=('psf', 'aperture', 'subaperture'),
+                      help="Extraction method (psf|[sub]aperture) [%default]",
+                      default="psf")
+    parser.add_option("-r", "--radius", type=float,
+                      help="Aperture radius for non-PSF extraction "
+                      "(>0: in \", <0: in seeing sigma) [%default]",
+                      default=-5.)
     parser.add_option("-L", "--leastSquares",
                       dest="least_squares", action="store_true",
                       help="Least-square fit [default is a chi2 fit]",
@@ -192,7 +200,7 @@ if __name__ == "__main__":
         fitter.meta_cube_model.WR_3d_fits(model_path, header=[])
 
     # Extract the point source spectrum
-    fitter.extract()
+    fitter.extract(method=opts.method, radius=opts.radius)
 
     # Write the point source and background spectra to fits files.
     fitter.write_spectrum(opts.out, opts.sky)

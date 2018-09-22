@@ -108,7 +108,7 @@ class SceneModel(object):
         # Clear the cache to set up cache-related structures.
         self.clear_cache()
 
-    def _create_grid(self, grid_size, border, subsampling):
+    def _create_grid(self, grid_size, border, subsampling, real_only=False):
         """Create a grid that the model can be evaluated on.
 
         grid_size should be a tuple with the y and x dimensions.
@@ -151,32 +151,16 @@ class SceneModel(object):
         pad_grid_x, pad_grid_y = np.meshgrid(pad_range_x, pad_range_y,
                                              indexing='ij')
 
-        kx = 2 * np.pi * np.fft.fftfreq(pad_grid_x.shape[0], step)
-        ky = 2 * np.pi * np.fft.fftfreq(pad_grid_x.shape[1], step)
-        pad_grid_kx, pad_grid_ky = np.meshgrid(kx, ky, indexing='ij')
-
-        subsampling_buffer = subsampling_buffer
-        pad_grid_x = pad_grid_x
-        pad_grid_y = pad_grid_y
-        pad_grid_kx = pad_grid_kx
-        pad_grid_ky = pad_grid_ky
-
         # Calculate the offset that the center position needs to be moved by to
         # be in the right location on the padded grid.
         pad_offset_x = border + subsampling_buffer + reference_i
         pad_offset_y = border + subsampling_buffer + reference_j
 
-        # Calculate the Fourier shift that needs to be applied to get an FFTed
-        # Fourier space model to the reference position and back.
-        pad_ifft_shift = np.exp(
-            - 1j * (pad_offset_x * pad_grid_kx + pad_offset_y * pad_grid_ky)
-        )
-        pad_fft_shift = np.conj(pad_ifft_shift)
-
         # Build a string that uniquely defines the grid so that two grid_infos
-        # can be compared for equality.
-        unique_str = '%d,%s,%d,%.6f,%.6f' % (
-            subsampling, grid_size, border, reference_i, reference_j
+        # can be compared easliy for equality.
+        unique_str = '%d,%s,%d,%.6f,%.6f,%s' % (
+            subsampling, grid_size, border, reference_i, reference_j, 'R' if
+            real_only else 'RF'
         )
 
         # Build a structure that holds all of the grid information
@@ -196,17 +180,32 @@ class SceneModel(object):
             'subsampling_buffer': subsampling_buffer,
             'pad_grid_x': pad_grid_x,
             'pad_grid_y': pad_grid_y,
-            'pad_grid_kx': pad_grid_kx,
-            'pad_grid_ky': pad_grid_ky,
 
             'pad_offset_x': pad_offset_x,
             'pad_offset_y': pad_offset_y,
 
-            'pad_fft_shift': pad_fft_shift,
-            'pad_ifft_shift': pad_ifft_shift,
-
             'unique_str': unique_str,
         }
+
+        # If real_only is set, we don't calculate the Fourier grid information.
+        if real_only:
+            return grid_info
+
+        kx = 2 * np.pi * np.fft.fftfreq(pad_grid_x.shape[0], step)
+        ky = 2 * np.pi * np.fft.fftfreq(pad_grid_x.shape[1], step)
+        pad_grid_kx, pad_grid_ky = np.meshgrid(kx, ky, indexing='ij')
+
+        # Calculate the Fourier shift that needs to be applied to get an FFTed
+        # Fourier space model to the reference position and back.
+        pad_ifft_shift = np.exp(
+            - 1j * (pad_offset_x * pad_grid_kx + pad_offset_y * pad_grid_ky)
+        )
+        pad_fft_shift = np.conj(pad_ifft_shift)
+
+        grid_info['pad_grid_kx'] = pad_grid_kx
+        grid_info['pad_grid_ky'] = pad_grid_ky
+        grid_info['pad_fft_shift'] = pad_fft_shift
+        grid_info['pad_ifft_shift'] = pad_ifft_shift
 
         return grid_info
 
@@ -765,7 +764,7 @@ class SceneModel(object):
             raise SceneModelException("Found degenerate model for parameters: "
                                       "%s" % parameters)
         values = np.dot(cov, beta)
-        variances = np.diag(cov)
+        variances = np.diag(cov).copy()
 
         return parameter_names, values, variances
 
@@ -808,14 +807,11 @@ class SceneModel(object):
             fit_scale = 1.
 
         for parameter_name, parameter_dict in self._parameter_info.items():
-            try:
-                if (parameter_dict['fixed'] or parameter_dict['derived'] or
-                        (parameter_dict['coefficient'] and
-                         do_analytic_coefficients)):
-                    # Parameter that isn't fitted, ignore it.
-                    continue
-            except:
-                from IPython import embed; embed()
+            if (parameter_dict['fixed'] or parameter_dict['derived'] or
+                    (parameter_dict['coefficient'] and
+                     do_analytic_coefficients)):
+                # Parameter that isn't fitted, ignore it.
+                continue
 
             new_dict = parameter_dict.copy()
 
@@ -1121,7 +1117,9 @@ class SceneModel(object):
 
         return num_data - num_parameters
 
-    def extract(self, images, variances=None, **parameters):
+    def extract(self, images, variances=None, method='psf', radius=None,
+                aperture_subsampling=16, amplitude_key='amplitude',
+                **parameters):
         """Extract the coefficent parameters from a set of images.
 
         Coefficients refer to any parameters in the model that scale a
@@ -1134,6 +1132,18 @@ class SceneModel(object):
         images be either a single image or a list of images. Specifying the
         variance with variances is optional (a least-squares extraction will be
         done), but if done it must have the same shape as images.
+
+        There are several extraction methods that can be used:
+        - psf: Fits the PSF and background to the data, and returns the fitted
+        amplitudes.
+        - aperture: Does the initial fit, but only uses it to determine the
+        background level. The PSF amplitude is then estimated from aperture
+        photometry with subpixel resolution. The radius parameter specifies the
+        radius of the aperture in pixels. aperture_subsampling specifies how
+        much to subsample the aperture by.
+
+        If you don't want the background to be subtracted, fix the background
+        to 0 before calling this method.
         """
         # Handle the case where we want to extract a single image. After this,
         # images and variances will always be a list of images and variances.
@@ -1173,7 +1183,7 @@ class SceneModel(object):
                 variance = variances[idx]
             else:
                 variance = None
-            image_fit_data = self._process_image(images[idx], variance)
+            image_info = self._process_image(images[idx], variance)
 
             # Calculate the components of the scene
             components, eval_parameters = self.evaluate(
@@ -1184,18 +1194,36 @@ class SceneModel(object):
             )
 
             # Evaluate the coefficients analytically
-            coef_names, coef_values, coef_variances = \
+            coefficient_data = \
                 self._calculate_coefficients(
                     components,
-                    image_fit_data['mask_data'],
-                    image_fit_data['mask_variance'],
-                    image_fit_data['mask'],
+                    image_info['mask_data'],
+                    image_info['mask_variance'],
+                    image_info['mask'],
                     **eval_parameters
                 )
 
+            if method == "psf":
+                # We're done, use the fitted amplitude.
+                pass
+            elif method in ["subaperture", "aperture"]:
+                # Recalculate the amplitude using aperture photometry.
+                if method == "aperture":
+                    # Don't subsample.
+                    aperture_subsampling = 1
+
+                center_x, center_y = self._get_center_position(eval_parameters)
+                coefficient_data = self._do_aperture_photometry(
+                    center_x, center_y, radius, components, coefficient_data,
+                    image_info, aperture_subsampling=aperture_subsampling,
+                    amplitude_key=amplitude_key
+                )
+            else:
+                raise SceneModelException("Unknown extraction method %s!" %
+                                          method)
+
             result = {}
-            for name, value, variance in zip(coef_names, coef_values,
-                                             coef_variances):
+            for name, value, variance in zip(*coefficient_data):
                 result[name] = value
                 result["%s_variance" % name] = variance
 
@@ -1204,6 +1232,104 @@ class SceneModel(object):
         extraction_results = Table(extraction_results)
 
         return extraction_results
+
+    def _get_center_position(self, full_parameters):
+        """Return the center position of the model for the given parameters
+        array.
+
+        This is used to define the aperture for aperture photometry, and can be
+        implemented in various ways by subclasses. By default, the parameter
+        values for the center_x and center_y keys are returned.
+        """
+        return full_parameters['center_x'], full_parameters['center_y']
+
+    def _do_aperture_photometry(self, center_x, center_y, radius, components,
+                                coefficient_info, image_info,
+                                aperture_subsampling=16,
+                                amplitude_key='amplitude'):
+        """Apply the coefficients for each component to get the full model.
+
+        coefficient_info is the output of _calculate_coefficients, and is
+        a tuple with lists of the coefficient names, values and variances.
+
+        image_info is the output of _process_image, and contains a processed
+        image with lots of derived quantities.
+
+        A circular aperture is used that is centered at (center_x, center_y)
+        with a radius specified by the radius parameter in pixels.
+
+        The aperture is subsampled by a factor specified by subsampling.
+        """
+        coef_names, coef_values, coef_variances = coefficient_info
+
+        # Make sure that the radius was specified.
+        if radius is None:
+            raise SceneModelException(
+                "Radius must be specified for aperture photometry!"
+            )
+
+        # Find the index of the key representing the amplitude that we are
+        # updating.
+        try:
+            amplitude_index = coef_names.index(amplitude_key)
+        except ValueError:
+            raise SceneModelException(
+                "Aperture photometry failed! No key %s found!" % amplitude_key
+            )
+
+        # Set the value of that coefficient to 0 and evaluate the rest of the
+        # model. We subtract the remaining model off before doing aperture
+        # photometry.
+        coef_values[amplitude_index] = 0.
+        remaining_model = self._apply_coefficients(
+            components, **dict(zip(coef_names, coef_values))
+        )
+
+        mask_remaining_model = remaining_model[image_info['mask']]
+        use_data = image_info['mask_data'] - mask_remaining_model
+        use_variance = image_info['mask_variance']
+
+        # Build the aperture array.
+        grid_size = image_info['image'].shape
+        aperture_grid_info = self._create_grid(
+            grid_size, 0, aperture_subsampling, real_only=True
+        )
+        subsampled_radius2 = (
+            (aperture_grid_info['pad_grid_x'] - center_x)**2 +
+            (aperture_grid_info['pad_grid_y'] - center_y)**2
+        )
+        subsampled_aperture = (subsampled_radius2 < radius**2).astype(float)
+
+        # Check if the aperture is contained within the image.
+        out_dist = np.max((
+            -(center_x - radius) + np.min(aperture_grid_info['pad_grid_x']),
+            -(center_y - radius) + np.min(aperture_grid_info['pad_grid_y']),
+            center_x + radius - np.max(aperture_grid_info['pad_grid_x']),
+            center_y + radius - np.max(aperture_grid_info['pad_grid_y']),
+        ))
+        if out_dist > 0:
+            print("WARNING: Aperture (r=%.2f spx) is outside of the image by "
+                  "%.2f spx!" % (radius, out_dist))
+
+        # Add up all of the subsamplings to get the weights for the aperture.
+        weights = 0.
+        for i in range(aperture_subsampling):
+            for j in range(aperture_subsampling):
+                weights += subsampled_aperture[
+                    i::aperture_subsampling, j::aperture_subsampling
+                ]
+        weights /= aperture_subsampling**2
+
+        # Calculate the aperture amplitude and variance.
+        mask = image_info['mask']
+        aperture_amplitude = np.sum(use_data * weights[mask])
+        aperture_variance = np.sum(use_variance * weights[mask]**2)
+
+        # Update the coefficient_info array
+        coef_values[amplitude_index] = aperture_amplitude
+        coef_variances[amplitude_index] = aperture_variance
+
+        return coef_names, coef_values, coef_variances
 
     def get_fits_header_items(self, prefix=config.default_fits_prefix):
         """Get a list of parameters to put into the fits header.

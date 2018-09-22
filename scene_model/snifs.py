@@ -8,7 +8,7 @@ from astropy.table import Table
 from scipy.optimize import leastsq
 
 from . import config
-from .utils import SceneModelException, extract_key, nmad
+from .utils import SceneModelException, extract_key
 from .element import ConvolutionElement, PsfElement, Pixelizer, RealPixelizer
 from .scene import SceneModel
 from .models import GaussianMoffatPsfElement, \
@@ -20,7 +20,7 @@ from .models import GaussianMoffatPsfElement, \
     ChromaticExponentialPowerPsfElement, \
     GaussianSceneModel
 from .fit import MultipleImageFitter
-from .prior import GaussianPrior, MultivariateGaussianPrior
+from .prior import MultivariateGaussianPrior
 
 # If we are using autograd, then we need to use a special version of numpy.
 from .config import numpy as np
@@ -278,6 +278,27 @@ def write_pysnifs_spectrum(spectrum, path=None, header=None):
     return hduList                  # For further handling if needed
 
 
+def convert_radius_to_pixels(radius, seeing, spaxel_size):
+    """Parse a radius in arcseconds/sigmas and convert it to a radius in
+    pixels.
+
+    If the radius is less than 0, then it is interpreted as a multiple of the
+    seeing sigma. If the radius is greater than 0, then it is interpreted as a
+    radius in arcseconds.
+    """
+    if radius > 0:
+        # Explicit radius in arcseconds
+        pass
+    else:
+        # Radius in multiples of the seeing sigma
+        radius = -radius * seeing / 2.355
+
+    # Convert the radius from arcseconds to spaxels
+    radius /= spaxel_size
+
+    return radius
+
+
 def get_background_element(background_degree):
     """Set up a background element for a given degree.
 
@@ -297,7 +318,7 @@ def get_background_element(background_degree):
         background_element = PolynomialBackground(
             background_degree=background_degree
         )
-    elif background_element == -1:
+    elif background_degree == -1:
         # No background
         background_element = None
     else:
@@ -338,21 +359,42 @@ class SnifsAdrElement(ConvolutionElement):
         self._add_parameter('adr_theta', 0., (None, None), 'THETA',
                             'ADR theta parameter')
 
-    def _evaluate_fourier(self, kx, ky, subsampling, grid_info, wavelength,
-                          adr_delta, adr_theta, **kwargs):
-        if wavelength is None:
+        # Add the shifts introduced by the ADR as explicit parameters so that
+        # we can pull them out in other places.
+        self._add_parameter('adr_shift_x', None, (None, None), 'ADRX',
+                            'ADR shift in the X direction', derived=True)
+        self._add_parameter('adr_shift_y', None, (None, None), 'ADRY',
+                            'ADR shift in the Y direction', derived=True)
+
+    def _calculate_derived_parameters(self, parameters):
+        """Calculate the shifts introduced by the ADR"""
+        p = parameters
+
+        if p['wavelength'] is None:
             raise SceneModelException("Must set wavelength for %s!" %
                                       type(self))
         if self.adr_model is None:
             raise SceneModelException("Must setup the ADR model for %s!" %
                                       type(self))
 
-        adr_scale = self.adr_model.get_scale(wavelength) / self.spaxel_size
+        adr_scale = (self.adr_model.get_scale(p['wavelength']) /
+                     self.spaxel_size)
+        shift_x = p['adr_delta'] * np.sin(p['adr_theta']) * adr_scale
+        shift_y = -p['adr_delta'] * np.cos(p['adr_theta']) * adr_scale
 
-        shift_x = adr_delta * np.sin(adr_theta) * adr_scale
-        shift_y = -adr_delta * np.cos(adr_theta) * adr_scale
+        p['adr_shift_x'] = shift_x
+        p['adr_shift_y'] = shift_y
 
-        shift_fourier = np.exp(-1j * (shift_x * kx + shift_y * ky))
+        # Update parameters from the superclass
+        parent_parameters = super(SnifsAdrElement, self).\
+            _calculate_derived_parameters(p)
+
+        return parent_parameters
+
+    def _evaluate_fourier(self, kx, ky, subsampling, grid_info, adr_shift_x,
+                          adr_shift_y, **kwargs):
+        """Apply a translation to the model in Fourier space"""
+        shift_fourier = np.exp(-1j * (adr_shift_x * kx + adr_shift_y * ky))
 
         return shift_fourier
 
@@ -947,23 +989,43 @@ class SnifsFourierSceneModel(SceneModel):
         ES_).
         """
         wavelength_dependence = fits_header[prefix + 'WDEP']
+        background_degree = fits_header[prefix + 'SDEG']
 
         if wavelength_dependence:
             spaxel_size = fits_header[prefix + 'SPXSZ']
             pressure, temperature = read_pressure_and_temperature(fits_header)
-            scene_model = cls(use_empirical_parameters=False,
-                              wavelength_dependence=True,
-                              spaxel_size=spaxel_size, pressure=pressure,
-                              temperature=temperature)
+            scene_model = cls(
+                use_empirical_parameters=False,
+                wavelength_dependence=True,
+                background_degree=background_degree,
+                spaxel_size=spaxel_size,
+                pressure=pressure,
+                temperature=temperature
+            )
         else:
-            scene_model = cls(use_empirical_parameters=False,
-                              wavelength_dependence=False)
+            scene_model = cls(
+                use_empirical_parameters=False,
+                wavelength_dependence=False,
+                background_degree=background_degree
+            )
 
         # Read in the rest of the parameters
         scene_model.load_fits_header(fits_header, prefix=prefix,
                                      skip_parameters=['wavelength'])
 
         return scene_model
+
+    def _get_center_position(self, parameters):
+        if self.wavelength_dependence:
+            # Add in the ADR shift.
+            center_x = parameters['ref_center_x'] + parameters['adr_shift_x']
+            center_y = parameters['ref_center_y'] + parameters['adr_shift_y']
+            return (center_x, center_y)
+        else:
+            # Use the default.
+            return super(SnifsFourierSceneModel, self)._get_center_position(
+                parameters
+            )
 
 
 class SnifsClassicSceneModel(SceneModel):
@@ -1049,6 +1111,18 @@ class SnifsClassicSceneModel(SceneModel):
             **kwargs
         )
 
+    def _get_center_position(self, parameters):
+        if self.wavelength_dependence:
+            # Add in the ADR shift.
+            center_x = parameters['ref_center_x'] + parameters['adr_shift_x']
+            center_y = parameters['ref_center_y'] + parameters['adr_shift_y']
+            return (center_x, center_y)
+        else:
+            # Use the default.
+            return super(SnifsClassicSceneModel, self)._get_center_position(
+                parameters
+            )
+
 
 class SnifsCubeFitter(object):
     """Fitter to fit a SNIFS cube.
@@ -1097,6 +1171,8 @@ class SnifsCubeFitter(object):
 
         # Extraction
         self.extraction = None
+        self.extraction_method = None
+        self.extraction_radius = None
         self.point_source_spectrum = None
         self.background_spectrum = None
 
@@ -1261,8 +1337,8 @@ class SnifsCubeFitter(object):
                                       self.background_degree)
 
         self.print_message("  Channel: '%s'" % self.channel)
-        self.print_message("  Fit method: %s" % ('chi2' if self.least_squares
-                                                 else 'least-squares'))
+        self.print_message("  Fit method: %s" % (
+            'least-squares' if self.least_squares else 'chi2'))
 
         # Initial ADR model
         self.print_message(
@@ -1798,19 +1874,43 @@ class SnifsCubeFitter(object):
                 (fit_seeing_widths.min(),
                  self.meta_cube.lbda[fit_seeing_widths.argmin()]))
 
-    def extract(self):
+    def extract(self, method='psf', radius=None, **kwargs):
+        """Extract the PSF. See SceneModel.extract for details.
+
+        If aperture photometry is being performed, radius is interpreted
+        as a multiple of the seeing sigmas if it is less than 0, and a radius
+        in arcseconds if it is greater than 0.
+        """
         # Make sure that the 3D fit has already been done.
         if self.fit_scene_model is None:
             raise SceneModelException(
                 "Must run the 3D metaslice fit before extracting!"
             )
 
-        print("Extracting the point-source spectrum...")
+        if method == "psf":
+            method_str = "psf, %s" % ("least-squares" if self.least_squares
+                                      else "chi2")
+        else:
+            method_str = "%s, r=%.2f" % (method, radius)
+
+        print("Extracting the point-source spectrum (%s)..." % method_str)
 
         cube_data, cube_var = cube_to_arrays(self.cube)
 
+        if self.least_squares:
+            cube_var = None
+
+        # Convert the radius to pixels.
+        if radius is not None:
+            pixel_radius = convert_radius_to_pixels(
+                radius, self.reference_seeing, self.cube.spxSize
+            )
+        else:
+            pixel_radius = None
+
         extraction = self.fit_scene_model.extract(
-            cube_data, cube_var, wavelength=self.cube.lbda
+            cube_data, cube_var, method=method, radius=pixel_radius,
+            wavelength=self.cube.lbda
         )
 
         # Build a pySNIFS object for the point source
@@ -1839,6 +1939,11 @@ class SnifsCubeFitter(object):
                 step=self.cube.lstep,
             )
             self.sky_spectrum = sky_spectrum
+
+        # Save the information about the extraction.
+        self.extraction_method = method
+        if method == 'aperture' or method == 'subaperture':
+            self.extraction_radius = radius
 
         self.extraction = extraction
 
@@ -1879,6 +1984,11 @@ class SnifsCubeFitter(object):
         header[p('PSF')] = (self.psf, 'PSF model name')
         header[p('SUB')] = (self.subsampling, 'Model subsampling')
         header[p('BORD')] = (self.border, 'Model border')
+
+        header[p('METH')] = (self.extraction_method, 'Extraction method')
+        if self.extraction_radius is not None:
+            header[p('APRAD')] = (self.extraction_radius,
+                                  'Aperture radius [" or sigma]')
 
         tflux = self.extraction['amplitude'].sum()
         header[p('TFLUX')] = (tflux, 'Total point-source flux')
@@ -2302,7 +2412,6 @@ class SnifsCubeFitter(object):
         if path is not None:
             self.print_message("Producing seeing plot %s..." % path, 1)
 
-        import matplotlib
         from matplotlib import pyplot as plt
 
         # The first subplot is seeing. The other 2 subplots will show different
@@ -2546,7 +2655,6 @@ class SnifsCubeFitter(object):
         if path is not None:
             self.print_message("Producing radial profile plot %s..." % path, 1)
 
-        import matplotlib
         from matplotlib import pyplot as plt
 
         wavelengths = self.meta_cube.lbda

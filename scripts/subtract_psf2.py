@@ -4,9 +4,6 @@ from __future__ import print_function
 
 """Generate (and subtract) extract_star PSF cube from extracted spectrum"""
 
-__author__ = "Y. Copin <y.copin@ipnl.in2p3.fr>"
-__version__ = '$Id: subtract_psf.py,v 1.12 2014/07/07 14:51:02 ycopin Exp $'
-
 import os
 import numpy as np
 import pySNIFS
@@ -19,7 +16,9 @@ if __name__ == '__main__':
     import optparse
 
     usage = "Usage: [%prog] [options] inspec.fits"
-    parser = optparse.OptionParser(usage, version=__version__)
+    parser = optparse.OptionParser(
+        usage, version=scene_model.config.__version__
+    )
 
     parser.add_option("-r", "--ref",
                       help="Reference datacube")
