@@ -40,9 +40,9 @@ class GaussianPointSource(SubsampledModelComponent):
     def _setup_parameters(self):
         self._add_parameter('amplitude', None, (None, None), 'AMP',
                             'Point source amplitude', coefficient=True)
-        self._add_parameter('center_x', None, (None, None), 'POSX',
+        self._add_parameter('center_x', None, (None, None), 'XC',
                             'Point source center position X')
-        self._add_parameter('center_y', None, (None, None), 'POSY',
+        self._add_parameter('center_y', None, (None, None), 'YC',
                             'Point source center position Y')
         self._add_parameter('sigma_x', 1., (0.1, 20.), 'SIGX',
                             'Gaussian width in X direction')
