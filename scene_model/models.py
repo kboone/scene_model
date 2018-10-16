@@ -15,9 +15,9 @@ class PointSource(SubsampledModelComponent):
     def _setup_parameters(self):
         self._add_parameter('amplitude', 1., (None, None), 'AMP',
                             'Point source amplitude', coefficient=True)
-        self._add_parameter('center_x', 0., (None, None), 'POSX',
+        self._add_parameter('center_x', 0., (None, None), 'XC',
                             'Point source center position X')
-        self._add_parameter('center_y', 0., (None, None), 'POSY',
+        self._add_parameter('center_y', 0., (None, None), 'YC',
                             'Point source center position Y')
 
     def _evaluate_fourier(self, kx, ky, subsampling, grid_info, amplitude,
