@@ -33,7 +33,7 @@ try:
     from ToolBox import MPL
     import pySNIFS
 except ImportError as e:
-    print("WARNING: Unable to load SNIFS libraries! (%s)" % e.message)
+    print("WARNING: Unable to load SNIFS libraries! (%s)" % e)
     print("Some functionality will be disabled.")
 
 

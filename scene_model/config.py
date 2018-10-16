@@ -14,6 +14,7 @@ __author__ = "K. Boone, Y. Copin, C. Buton, E. Pecontal"
 # extremely old and not compatible with the autograd package, so we can't use
 # it there. This can be enabled on private machines to speed things up a lot.
 use_autograd = False
+# use_autograd = True
 
 # Use a constant reference wavelength for easy comparisons.
 reference_wavelength = 5000.

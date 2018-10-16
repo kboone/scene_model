@@ -764,7 +764,7 @@ class SceneModel(object):
             raise SceneModelException("Found degenerate model for parameters: "
                                       "%s" % parameters)
         values = np.dot(cov, beta)
-        variances = np.diag(cov).copy()
+        variances = np.diag(cov) + 0.
 
         return parameter_names, values, variances
 
@@ -833,7 +833,7 @@ class SceneModel(object):
 
         return parameters
 
-    def fit(self, do_analytic_coefficients=True, verbose=False):
+    def fit(self, do_analytic_coefficients=True, verbose=False, ftol=1e-10):
         fit_parameters = self._get_fit_parameters(do_analytic_coefficients)
 
         parameter_names = list(fit_parameters.keys())
@@ -861,7 +861,7 @@ class SceneModel(object):
             bounds=bounds,
             jac=grad(chi_square_flat) if config.use_autograd else None,
             method='L-BFGS-B',
-            options={'maxiter': 400, 'ftol': 1e-10},
+            options={'maxiter': 400, 'ftol': ftol},
         )
 
         if not res.success:
@@ -1424,17 +1424,19 @@ class SceneModel(object):
 
         norm = LogNorm(vmin=scale_min, vmax=scale_max)
 
-        image[np.isnan(image)] = -1
-        image[image < 0] = scale_min / 2.
-        model[model < 0] = scale_min / 2.
+        mask_image = image.copy()
+        mask_model = model.copy()
+        mask_image[np.isnan(mask_image)] = -1
+        mask_image[image < 0] = scale_min / 2.
+        mask_model[model < 0] = scale_min / 2.
 
         plt.subplot(2, 2, 1)
-        plt.imshow(image.T, origin='lower', norm=norm)
+        plt.imshow(mask_image.T, origin='lower', norm=norm)
         plt.title('Data')
         plt.colorbar()
 
         plt.subplot(2, 2, 2)
-        plt.imshow(model.T, origin='lower', norm=norm)
+        plt.imshow(mask_model.T, origin='lower', norm=norm)
         plt.title('Model')
         plt.colorbar()
 
@@ -1453,7 +1455,7 @@ class SceneModel(object):
 
         plt.subplot(2, 2, 4)
         data_contour = plt.contour(
-            np.log10(image).T,
+            np.log10(mask_image).T,
             levels=contour_levels,
             colors=contour_colors,
             origin='lower',
@@ -1463,7 +1465,7 @@ class SceneModel(object):
         # Need to chop out any levels that aren't used or the colors get messed
         # up...
         mask = []
-        log_model = np.log10(model)
+        log_model = np.log10(mask_model)
         for i in contour_levels:
             if np.all(i < log_model) or np.all(i > log_model):
                 mask.append(False)
@@ -1537,6 +1539,39 @@ class SceneModel(object):
             plt.ylim(min_val / 5., np.max(plot_data)*2)
 
         plt.legend()
+
+    def plot_model_radial_profile(self, new_figure=True, parameters={},
+                                  **kwargs):
+        """Plot the radial profile of only the model under the assumption that
+        the model is radially symmetric.
+
+        For a non radially symmetric model, this will have a ton of jagged
+        lines. This can be used to study the radial profiles of various models.
+        """
+        from matplotlib import pyplot as plt
+
+        p = dict(self.parameters, **parameters)
+
+        if new_figure:
+            plt.figure()
+
+        dx = self.grid_info['grid_x'] - p['center_x']
+        dy = self.grid_info['grid_y'] - p['center_y']
+        r = np.sqrt(dx**2 + dy**2)
+
+        amplitude = p['amplitude']
+
+        model = self.evaluate(**parameters)
+
+        scale_model = model / amplitude
+
+        order = np.argsort(r.flat)
+        plt.plot(r.flat[order], scale_model.flat[order], **kwargs)
+
+        plt.xlim(0.5, np.max(r) * 1.2)
+        plt.ylim(1e-6, 1.)
+        plt.xscale('log')
+        plt.yscale('log')
 
     def fit_and_fix_position(self, verbose=False, center_x_key='center_x',
                              center_y_key='center_y', border=0, subsampling=3,

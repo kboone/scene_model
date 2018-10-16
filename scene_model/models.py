@@ -13,11 +13,11 @@ from .config import numpy as np
 
 class PointSource(SubsampledModelComponent):
     def _setup_parameters(self):
-        self._add_parameter('amplitude', None, (None, None), 'AMP',
+        self._add_parameter('amplitude', 1., (None, None), 'AMP',
                             'Point source amplitude', coefficient=True)
-        self._add_parameter('center_x', None, (None, None), 'POSX',
+        self._add_parameter('center_x', 0., (None, None), 'POSX',
                             'Point source center position X')
-        self._add_parameter('center_y', None, (None, None), 'POSY',
+        self._add_parameter('center_y', 0., (None, None), 'POSY',
                             'Point source center position Y')
 
     def _evaluate_fourier(self, kx, ky, subsampling, grid_info, amplitude,
@@ -239,14 +239,53 @@ class ExponentialPowerPsfElement(PsfElement):
     """
     def _setup_parameters(self):
         self._add_parameter('power', 1.6, (0., 2.), 'POW', 'power')
-        self._add_parameter('width', 0.5, (0.01, 30.), 'WID', 'width')
+        self._add_parameter('width', 0.5, (0.001, 30.), 'WID', 'width')
 
     def _evaluate_fourier(self, kx, ky, subsampling, grid_info, power, width,
                           **kwargs):
         k = np.sqrt(kx*kx + ky*ky)
 
-        # fourier_profile = np.exp(-width**power * k**power)
         fourier_profile = np.exp(-width**power * k**power)
+
+        return fourier_profile
+
+
+class DeltaExponentialPsfElement(PsfElement):
+    """A Psf model element that is the sum of a delta function and a
+    Fourier exponential profile .
+    """
+    def _setup_parameters(self):
+        self._add_parameter('delta_fraction', 0.5, (0., 1.), 'DELT',
+                            'delta function fraction')
+        self._add_parameter('power', 1.6, (0., 2.), 'POW', 'power')
+        self._add_parameter('width', 0.5, (0.001, 30.), 'WID', 'width')
+
+    def _evaluate_fourier(self, kx, ky, subsampling, grid_info, delta_fraction,
+                          power, width, **kwargs):
+        k = np.sqrt(kx*kx + ky*ky)
+
+        fourier_profile = (
+            delta_fraction +
+            (1 - delta_fraction) * np.exp(-width**power * k**power)
+        )
+
+        return fourier_profile
+
+
+class FourierMoffatPsfElement(PsfElement):
+    """A Psf model element that has a Fourier profile of a Moffat distribution.
+
+    This is not theoretically motivated in any way.
+    """
+    def _setup_parameters(self):
+        self._add_parameter('alpha', 1., (0.0001, 100.), 'ALPHA', 'alpha')
+        self._add_parameter('beta', 2., (0., 5.), 'BETA', 'beta')
+
+    def _evaluate_fourier(self, kx, ky, subsampling, grid_info, alpha, beta,
+                          **kwargs):
+        k2 = kx*kx + ky*ky
+
+        fourier_profile = (1 + k2 / alpha**2)**(-beta)
 
         return fourier_profile
 
@@ -260,6 +299,46 @@ class KolmogorovPsfElement(ExponentialPowerPsfElement):
         super(KolmogorovPsfElement, self)._setup_parameters()
 
         self.fix(power=5./3.)
+
+
+class VonKarmanPsfElement(PsfElement):
+    """VonKarman PSF.
+
+    In Fourier space, this has the form:
+
+        r0^(-5/3) * (f^2 + L0^-2)^(-11/6)
+
+    where r0 is the Fried parameter and L0 is the outer scale.
+    """
+    def _setup_parameters(self):
+        self._add_parameter('r0', 1., (0., None), 'R0',
+                            'von Karman Fried parameter')
+        self._add_parameter('L0', 20., (1., None), 'L0',
+                            'von Karman outer scale')
+
+    def _evaluate_fourier(self, kx, ky, subsampling, grid_info, r0, L0,
+                          **kwargs):
+        k = np.sqrt(kx*kx + ky*ky)
+        # fourier_profile = np.exp(-r0**(5/3.) * (k**2 + L0**-2)**(11/6.))
+        # fourier_profile = np.exp(
+            # -(L0 / r0)**(5/3.) * (
+                # + 1.87439 * (k / L0)**(5/3.)
+                # - 1.50845 * (k / L0)**2.
+            # )
+        # )
+        from scipy.special import kv, gamma
+        fourier_profile = np.exp(
+            -(L0 / r0)**(5/3.) * (
+                gamma(5/6.) / 2**(1/6.) -
+                (k / L0)**(5/6.) * kv(5/6., k / L0)
+            )
+        )
+
+        # Set the (0, 0) bin to 1. The profile has that as the limit, but the
+        # above calculation will give nan.
+        fourier_profile[0, 0] = 1.
+
+        return fourier_profile
 
 
 class ChromaticExponentialPowerPsfElement(ExponentialPowerPsfElement):

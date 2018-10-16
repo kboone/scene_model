@@ -496,7 +496,7 @@ class MultipleImageFitter():
         be assigned to each image.
         """
         for key, value in kwargs.items():
-            if np.isscalar(value):
+            if np.isscalar(value) or value is None:
                 for scene_model in self.scene_models:
                     scene_model.fix(**{key: value})
                 self._global_fixed_parameters[key] = value
@@ -703,7 +703,7 @@ class MultipleImageFitter():
         models = np.array(models)
         return models
 
-    def fit(self, do_analytic_coefficients=True, verbose=False):
+    def fit(self, do_analytic_coefficients=True, verbose=False, ftol=1e-10):
         global_parameters, individual_parameters = \
             self._get_fit_parameters(do_analytic_coefficients)
 
@@ -736,7 +736,7 @@ class MultipleImageFitter():
             bounds=bounds,
             jac=grad(chi_square_flat) if config.use_autograd else None,
             method='L-BFGS-B',
-            options={'maxiter': 400, 'ftol': 1e-10},
+            options={'maxiter': 400, 'ftol': ftol},
         )
 
         if not res.success:
