@@ -12,6 +12,12 @@ from astropy.io import fits
 import scene_model
 from scene_model.snifs import SnifsFourierSceneModel
 
+import warnings
+# Ignore warnings from pyfits.writeto
+# (https://github.com/spacetelescope/PyFITS/issues/43)
+warnings.filterwarnings("ignore", "Overwriting existing file")
+
+
 if __name__ == '__main__':
     import optparse
 
