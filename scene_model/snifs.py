@@ -1193,7 +1193,7 @@ class SnifsCubeFitter(object):
         # Load the cube
         self.print_message("Opening datacube %s" % path)
         cube = None
-        retries = 5
+        retries = 20
         while True:
             retries -= 1
             try:
@@ -1214,7 +1214,7 @@ class SnifsCubeFitter(object):
 
             if retries > 0:
                 print("WARNING: Failed to open file '%s'. Retrying..." % path)
-                time.sleep(1)
+                time.sleep(5)
             else:
                 raise SceneModelException("Failed to access file '%s'" % path)
 
