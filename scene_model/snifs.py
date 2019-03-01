@@ -2,6 +2,7 @@
 from __future__ import print_function
 
 import os
+import time
 from copy import deepcopy
 from astropy.io import fits
 from astropy.table import Table
@@ -1191,18 +1192,31 @@ class SnifsCubeFitter(object):
         """
         # Load the cube
         self.print_message("Opening datacube %s" % path)
-        try:
+        cube = None
+        retries = 5
+        while True:
+            retries -= 1
             try:
-                # Check what kind of cube we have. pySNIFS raises a ValueError
-                # if the cube is a Fits3d file that we tried to load as Euro3D.
-                header = fits.getheader(path, 1)
-                cube = pySNIFS.SNIFS_cube(e3d_file=path)
-            except ValueError:
-                # We have a 3D fits cube
-                header = fits.getheader(path, 0)  # Primary extension
-                cube = pySNIFS.SNIFS_cube(fits3d_file=path)
-        except IOError:
-            raise SceneModelException("Cannot access file '%s'" % path)
+                try:
+                    # Check what kind of cube we have. pySNIFS raises a
+                    # ValueError if the cube is a Fits3d file that we tried to
+                    # load as Euro3D.
+                    header = fits.getheader(path, 1)
+                    cube = pySNIFS.SNIFS_cube(e3d_file=path)
+                    break
+                except ValueError:
+                    # We have a 3D fits cube
+                    header = fits.getheader(path, 0)  # Primary extension
+                    cube = pySNIFS.SNIFS_cube(fits3d_file=path)
+                    break
+            except (IOError, IndexError):
+                pass
+
+            if retries > 0:
+                print("WARNING: Failed to open file '%s'. Retrying..." % path)
+                time.sleep(1)
+            else:
+                raise SceneModelException("Failed to access file '%s'" % path)
 
         # Update the parallactic angle in the header if it isn't there already
         if 'PARANG' not in header:
