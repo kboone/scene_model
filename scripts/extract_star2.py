@@ -72,6 +72,10 @@ if __name__ == "__main__":
                       dest="least_squares", action="store_true",
                       help="Least-square fit [default is a chi2 fit]",
                       default=False)
+    parser.add_option("--filterVariance", dest="filter_variance",
+                      action="store_true", help="Apply a filter in wavelength "
+                      "to the variance estimate to avoid Poisson biases.",
+                      default=False)
 
     # Plotting
     parser.add_option("-g", "--graph",
@@ -157,6 +161,7 @@ if __name__ == "__main__":
             subsampling=opts.subsampling,
             border=opts.border,
             least_squares=opts.least_squares,
+            filter_variance=opts.filter_variance,
             prior_scale=opts.usePriors,
             seeing_prior=opts.seeingPrior,
             accountant=accountant,

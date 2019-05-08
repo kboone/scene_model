@@ -184,6 +184,69 @@ def cube_to_arrays(cube):
 
     return data, var
 
+def apply_variance_filter(cube_var, filter_width=5):
+    """Apply a filter to the variance estimates of a SNIFS cube
+
+    The SNIFS variances are estimated from the fluxes in the CCD extraction. A
+    weighted mean of these fluxes is therefore biased low because the Poisson
+    noise leaks into the estimates of the Poisson uncertainties. By applying a
+    small filter to the variance in wavelength, we can remove these
+    correlations and get an unbiased estimate of the variance.
+
+    We have to be a little careful here because sometimes there is more going
+    on in the variance than just Poisson + Gaussian noise (eg: cosmics). To
+    address that, we look for abnormally large variance values compared to the
+    filtered ones and we keep them.
+
+    Because of resampling at the wavelength solution level, measured flux
+    values will be correlated with measured fluxes in adjacent wavelength bins.
+    For this reason, we use a filter that skips the target bin and adjacent
+    bins.
+
+    Any nan values are ignored in this process.
+
+    Parameters
+    ==========
+    cube_var:
+        Cube variance with shape (num_wave, num_spaxel_x, num_spaxel_y), as
+        output by cube_to_arrays.
+    filter_width:
+        Width in pixels of the filter to apply. This value is the maximum
+        distance in either direction, so the total filter size is
+        2*filter_width + 1.
+    """
+    filter_var_sum = np.zeros(cube_var.shape)
+    counts = np.zeros(cube_var.shape, dtype=int)
+
+    for offset in range(2, filter_width + 1):
+        # Forward direction
+        offset_var = cube_var[offset:]
+        mask = ~np.isnan(offset_var)
+        filter_var_sum[:-offset][mask] += offset_var[mask]
+        counts[:-offset] += mask
+
+        # Backwards direction
+        offset_var = cube_var[:-offset]
+        mask = ~np.isnan(offset_var)
+        filter_var_sum[offset:][mask] += offset_var[mask]
+        counts[offset:] += mask
+
+    no_counts_mask = counts == 0
+    counts[no_counts_mask] = -1
+
+    filter_var = filter_var_sum / counts
+    filter_var[no_counts_mask] = np.nan
+
+    # Check for abnormally large variances in the original data and keep them.
+    abnormal_mask = cube_var > 5 * filter_var
+    num_abnormal = np.sum(abnormal_mask)
+    if num_abnormal > 0:
+        print("WARNING: Found %d pixels with abnormally large variances! "
+              "Keeping them!" % num_abnormal)
+        filter_var[abnormal_mask] = cube_var[abnormal_mask]
+
+    return filter_var
+
 
 def evaluate_power_law(coefficients, x):
     """Evaluate (curved) power-law: coefficients[-1] * x**(coefficients[-2] +
@@ -1138,8 +1201,8 @@ class SnifsCubeFitter(object):
     def __init__(self, path, psf="fourier", background_degree=0,
                  subsampling=config.default_subsampling,
                  border=config.default_border, least_squares=False,
-                 prior_scale=0., seeing_prior=None, accountant=None,
-                 verbosity=0):
+                 filter_variance=False, prior_scale=0., seeing_prior=None,
+                 accountant=None, verbosity=0):
         """Initialize the fitter.
 
         path is the path to the fits cube that will be extracted.
@@ -1154,6 +1217,7 @@ class SnifsCubeFitter(object):
         self.subsampling = subsampling
         self.border = border
         self.least_squares = least_squares
+        self.filter_variance = filter_variance
         self.accountant = accountant
 
         # Meta cube variables. These are set in fit_metaslices_2d
@@ -1896,6 +1960,10 @@ class SnifsCubeFitter(object):
         print("Extracting the point-source spectrum (%s)..." % method_str)
 
         cube_data, cube_var = cube_to_arrays(self.cube)
+
+        # Filter the variance if set
+        if self.filter_variance:
+            cube_var = apply_variance_filter(cube_var)
 
         if self.least_squares:
             cube_var = None
