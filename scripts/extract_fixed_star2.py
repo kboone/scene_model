@@ -11,7 +11,7 @@ from astropy.io import fits
 
 import scene_model
 from scene_model.snifs import SnifsFourierSceneModel, cube_to_arrays, \
-    convert_radius_to_pixels
+    convert_radius_to_pixels, apply_variance_filter
 
 if __name__ == '__main__':
 
@@ -43,6 +43,10 @@ if __name__ == '__main__':
         "(>0: in arcsec, <0: in seeing sigma) [%default]",
         default=-5.
     )
+    parser.add_option("--filterVariance", dest="filter_variance",
+                      action="store_true", help="Apply a filter in wavelength "
+                      "to the variance estimate to avoid Poisson biases.",
+                      default=False)
 
     opts, args = parser.parse_args()
 
@@ -87,6 +91,11 @@ if __name__ == '__main__':
                                           cube.spxSize)
 
     cube_data, cube_var = cube_to_arrays(cube)
+
+    # Filter the variance if set
+    if opts.filter_variance:
+        cube_var = apply_variance_filter(cube_var)
+
     extraction = model.extract(cube_data, cube_var, wavelength=cube.lbda,
                                method=opts.method, radius=radius)
 
