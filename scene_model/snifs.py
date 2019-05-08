@@ -238,7 +238,7 @@ def apply_variance_filter(cube_var, filter_width=5):
     filter_var[no_counts_mask] = np.nan
 
     # Check for abnormally large variances in the original data and keep them.
-    abnormal_mask = cube_var > 5 * filter_var
+    abnormal_mask = np.isnan(cube_var) | (cube_var > 5 * filter_var)
     num_abnormal = np.sum(abnormal_mask)
     if num_abnormal > 0:
         print("WARNING: Found %d pixels with abnormally large variances! "
