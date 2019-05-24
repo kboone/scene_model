@@ -715,7 +715,7 @@ class SnifsClassicSeeingPrior(MultivariateGaussianPrior):
         seeing should be a GS seeing prediction from SNIFS.
         """
         channel = header['CHANNEL']
-        prior = cls(channel, channel, seeing, **kwargs)
+        prior = cls(channel, seeing, **kwargs)
 
         return prior
 
@@ -1119,6 +1119,8 @@ class SnifsClassicSceneModel(SceneModel):
                  background_degree=0, adr_model=None, spaxel_size=None,
                  pressure=None, temperature=None, **kwargs):
         """Build the elements of the PSF model."""
+        self.wavelength_dependence = wavelength_dependence
+
         elements = []
 
         if exposure_time is None:
@@ -1144,6 +1146,7 @@ class SnifsClassicSceneModel(SceneModel):
                 adr_model=adr_model, spaxel_size=spaxel_size,
                 pressure=pressure, temperature=temperature
             )
+            self.adr_element = adr_element
             elements.append(adr_element)
 
             # Rename the center position parameters to specify that they are
@@ -1173,6 +1176,65 @@ class SnifsClassicSceneModel(SceneModel):
             shared_parameters=shared_parameters,
             **kwargs
         )
+
+    def get_fits_header_items(self, prefix=config.default_fits_prefix):
+        """Get a list of parameters to put into the fits header.
+
+        Each entry has the form (fits_keyword, value, description).
+
+        We add in all additional keywords here that are necessary to recreate
+        the model from the fits header.
+        """
+        # Get the default list of keywords from the model elements.
+        fits_list = super(SnifsClassicSceneModel, self)\
+            .get_fits_header_items(prefix=prefix)
+
+        # Add in additional keys
+        fits_list.append((prefix + 'WDEP', self.wavelength_dependence,
+                          'Wavelength dependent scene model'))
+        if self.wavelength_dependence:
+            fits_list.append((prefix + 'SPXSZ', self.adr_element.spaxel_size,
+                              'Spaxel size'))
+
+        return fits_list
+
+    @classmethod
+    def from_fits_header(cls, fits_header, prefix=config.default_fits_prefix):
+        """Load the scene model from a fits header.
+
+        The header keys are assumed to all have prefix before in the
+        actual key used in the header (extract_star prefixes everything with
+        ES_).
+        """
+        wavelength_dependence = fits_header[prefix + 'WDEP']
+        background_degree = fits_header[prefix + 'SDEG']
+        exposure_time = fits_header['EFFTIME']
+
+        if wavelength_dependence:
+            spaxel_size = fits_header[prefix + 'SPXSZ']
+            pressure, temperature = read_pressure_and_temperature(fits_header)
+            scene_model = cls(
+                use_empirical_parameters=False,
+                wavelength_dependence=True,
+                exposure_time=exposure_time,
+                background_degree=background_degree,
+                spaxel_size=spaxel_size,
+                pressure=pressure,
+                temperature=temperature
+            )
+        else:
+            scene_model = cls(
+                use_empirical_parameters=False,
+                wavelength_dependence=False,
+                exposure_time=exposure_time,
+                background_degree=background_degree
+            )
+
+        # Read in the rest of the parameters
+        scene_model.load_fits_header(fits_header, prefix=prefix,
+                                     skip_parameters=['wavelength'])
+
+        return scene_model
 
     def _get_center_position(self, parameters):
         if self.wavelength_dependence:

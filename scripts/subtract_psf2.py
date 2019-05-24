@@ -10,7 +10,7 @@ import pySNIFS
 from astropy.io import fits
 
 import scene_model
-from scene_model.snifs import SnifsFourierSceneModel
+from scene_model.snifs import SnifsFourierSceneModel, SnifsClassicSceneModel
 
 import warnings
 # Ignore warnings from pyfits.writeto
@@ -61,7 +61,6 @@ if __name__ == '__main__':
     spec = pySNIFS.spectrum(args[0])
     # pySNIFS doesn't keep the header, so read that separately.
     header = fits.getheader(args[0])
-    print(spec)
 
     # Reference/input cube
     print("Opening reference cube %s" % opts.ref)
@@ -85,6 +84,8 @@ if __name__ == '__main__':
     psf = header['ES_PSF']
     if psf == 'fourier':
         model = SnifsFourierSceneModel.from_fits_header(header)
+    elif psf == 'classic':
+        model = SnifsClassicSceneModel.from_fits_header(header)
     else:
         parser.error("Unsupported PSF model ES_PSF=%s" % psf)
     model.setup_grid(grid_size=(15, 15))
