@@ -15,21 +15,6 @@ from .config import numpy as np
 if config.use_autograd:
     from autograd import grad, hessian
 
-# If we are using minuit for covariance estimation, figure out which version we
-# have. This packages is compatible with both iminuit and PyMinuit. iminuit is
-# strongly preferred. Neither is necessary to run the code, just use a
-# different method to calculate the covariance matrix.
-try:
-    import iminuit as minuit
-    minuit_version = 'iminuit'
-except ImportError:
-    import minuit
-    minuit_version = 'PyMinuit'
-except ImportError:
-    minuit = None
-    minuit_version = 'No minuit found'
-
-
 def hessian_to_covariance(hessian):
     """Safely invert a Hessian matrix to get a covariance matrix.
 
@@ -64,9 +49,6 @@ def calculate_covariance_finite_difference(chisq_function, parameter_names,
                                            values, bounds, verbose=False):
     """Do a 2nd order finite difference estimate of the covariance matrix.
 
-    This doesn't work very well because it doesn't use adaptive step sizes.
-    Minuit does much better with adaptive step sizes.
-
     For this, the formula is:
     d^2f(dx1*dx2) = ((f(x+e1+e2) - f(x+e1-e2) - f(x-e1+e2) + f(x-e1-e2))
                      / 4*e1*e2)
@@ -91,11 +73,6 @@ def calculate_covariance_finite_difference(chisq_function, parameter_names,
     # enough to be probing locally). We start by guessing a step size of 1e-5
     # (which is typically pretty reasonable for parameters that are of order 1)
     # and then bisect to find the right value.
-    # We also cap the maximum step size for parameters at 1. For parameters of
-    # order unity, this means that a change of 1 unit should make an
-    # appreciable difference in the resulting chi-square. If this doesn't
-    # happen, then something is wrong. An example of where this can happen is
-    # when the
     steps = []
     ref_chisq = chisq_function(values)
 
@@ -264,6 +241,23 @@ def calculate_covariance_finite_difference(chisq_function, parameter_names,
 
 def calculate_covariance_minuit(chisq_function, parameter_names, start_values,
                                 bounds, verbose=False):
+    # Figure out which version of minuit we have. This package is compatible
+    # with both iminuit and PyMinuit. iminuit is strongly preferred. Neither is
+    # necessary to run the code, just use a different method to calculate the
+    # covariance matrix.
+    try:
+        import iminuit as minuit
+        minuit_version = 'iminuit'
+    except ImportError:
+        try:
+            import minuit
+            minuit_version = 'PyMinuit'
+        except ImportError:
+            raise SceneModelException(
+                "No version of iminuit/PyMinuit installed! Either install it, "
+                "or use a different method to calculate the covariance."
+            )
+
     num_variables = len(parameter_names)
 
     minuit_kwargs = {}
