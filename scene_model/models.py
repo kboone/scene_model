@@ -214,11 +214,12 @@ class GaussianMoffatPsfElement(PsfElement):
     def _evaluate(self, x, y, subsampling, grid_info, alpha, sigma, beta, eta,
                   ell, xy, **kwargs):
         # Issue: with the pipeline parametrization, the radius can sometimes be
-        # negative which is obviously not physical. If samples in that region
-        # are chosen, set the signal to 0. The final result should never end up
-        # here.
-        if np.abs(xy) > np.sqrt(ell):
-            return np.zeros(x.shape)
+        # negative which is obviously not physical. Restrict the xy parameter
+        # so that when we evaluate it we get a radius very close to but not
+        # exactly 0 when that happens.
+        max_ratio = 0.99999
+        max_xy = max_ratio * np.sqrt(ell)
+        xy = np.clip(xy, -max_xy, max_xy)
 
         r2 = x**2 + ell * y**2 + 2 * xy * x * y
         gaussian = np.exp(-0.5 * r2 / sigma**2)
