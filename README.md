@@ -17,4 +17,4 @@ All of the model parameters can be fit to real data, using any kind of priors on
 
 This code was heavily inspired by the extract_star.py code written for the SNIFS instrument by Yannick Copin, Clement Buton and Emmanuel Pecontal and borrows code in several places from it.
 
-Documentation is currently very lacking. Contact me if you are interested in using this code.
+Documentation is currently very lacking, although most classes and methods have detailed docstrings if you dig into the code. Contact me if you are interested in using this code.
