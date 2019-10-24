@@ -523,7 +523,7 @@ class SnifsClassicPsfElement(GaussianMoffatPsfElement):
         """
         super(SnifsClassicPsfElement, self).__init__(*args, **kwargs)
 
-        if exposure_time < 15:
+        if exposure_time < 12:
             # Short exposure PSF
             self.beta0 = 1.395
             self.beta1 = 0.415
@@ -531,7 +531,7 @@ class SnifsClassicPsfElement(GaussianMoffatPsfElement):
             self.sigma1 = 0.2
             self.eta0 = 0.6
             self.eta1 = 0.16
-        elif exposure_time > 15:
+        else:
             # Long exposure PSF
             self.beta0 = 1.685
             self.beta1 = 0.345
